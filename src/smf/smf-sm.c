@@ -30,6 +30,7 @@
 #include "namf-handler.h"
 #include "nsmf-handler.h"
 #include "npcf-handler.h"
+#include "nchf-handler.h"
 #include "nsmf-handler.h"
 #include "binding.h"
 
@@ -87,6 +88,7 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
     ogs_pool_id_t sbi_xact_id = OGS_INVALID_POOL_ID;
     ogs_sbi_object_t *sbi_object = NULL;
     ogs_pool_id_t sbi_object_id = OGS_INVALID_POOL_ID;
+    OpenAPI_service_name_e xact_service_name = OpenAPI_service_name_NULL;
 
     ogs_nas_5gs_message_t nas_message;
     ogs_pkbuf_t *pkbuf = NULL;
@@ -748,6 +750,38 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
                 smf_namf_comm_handle_n1_n2_message_transfer_failure_notify(
                         stream, &sbi_message);
                 break;
+            CASE(OGS_SBI_RESOURCE_NAME_CHARGING_NOTIFY)
+                /* TS 32.291 §6.3.4 — the CHF reaching a live session, at
+                 * the notifyUri the SMF gave it in the ChargingDataRequest
+                 * (see smf_nchf_convergedcharging_build_create()). */
+                if (!sbi_message.h.resource.component[1]) {
+                    ogs_error("No smContextRef in ChargingNotify");
+                    ogs_assert(true ==
+                        ogs_sbi_server_send_error(stream,
+                            OGS_SBI_HTTP_STATUS_BAD_REQUEST, &sbi_message,
+                            "No smContextRef", NULL, NULL));
+                    break;
+                }
+
+                sess = smf_sess_find_by_sm_context_ref(
+                        sbi_message.h.resource.component[1]);
+                if (!sess) {
+                    /* The session ended between the CHF's read and its
+                     * POST; its Release settles the account. */
+                    ogs_warn("ChargingNotify for a session that is gone [%s]",
+                            sbi_message.h.uri);
+                    ogs_assert(true ==
+                        ogs_sbi_server_send_error(stream,
+                            OGS_SBI_HTTP_STATUS_NOT_FOUND, &sbi_message,
+                            "Not found",
+                            sbi_message.h.resource.component[1], NULL));
+                    break;
+                }
+
+                smf_nchf_convergedcharging_handle_charging_notify(
+                        sess, stream, &sbi_message);
+                break;
+
             CASE(OGS_SBI_RESOURCE_NAME_SM_POLICY_NOTIFY)
                 if (!sbi_message.h.resource.component[1]) {
                     ogs_error("No smContextRef [%s]",
@@ -840,6 +874,9 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         switch (service_name_id) {
         case OpenAPI_service_name_nudm_sdm:
             api_version = OGS_SBI_API_V2;
+            break;
+        case OpenAPI_service_name_nchf_convergedcharging:
+            api_version = "v3";
             break;
         default:
             api_version = OGS_SBI_API_V1;
@@ -943,12 +980,25 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
         case OpenAPI_service_name_npcf_smpolicycontrol:
         case OpenAPI_service_name_namf_comm:
         case OpenAPI_service_name_nsmf_pdusession:
+        case OpenAPI_service_name_nchf_convergedcharging:
             sbi_xact_id = OGS_POINTER_TO_UINT(e->h.sbi.data);
             ogs_assert(sbi_xact_id >= OGS_MIN_POOL_ID &&
                     sbi_xact_id <= OGS_MAX_POOL_ID);
 
             sbi_xact = ogs_sbi_xact_find_by_id(sbi_xact_id);
             if (!sbi_xact) {
+                /* A CHF Release is not awaited once its session is gone:
+                 * smf_sess_remove() drops the transaction, and the 204
+                 * lands here.  Not an error. */
+                if (service_name_id ==
+                        OpenAPI_service_name_nchf_convergedcharging &&
+                    sbi_message.h.resource.component[2] &&
+                    !strcmp(sbi_message.h.resource.component[2],
+                        OGS_SBI_RESOURCE_NAME_RELEASE)) {
+                    ogs_debug("CHF Release response after session removal "
+                              "[%d]", sbi_xact_id);
+                    break;
+                }
                 /* CLIENT_WAIT timer could remove SBI transaction
                  * before receiving SBI message */
                 ogs_error("SBI transaction has already been removed [%d]",
@@ -976,6 +1026,44 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
             ogs_assert(smf_ue);
             ogs_assert(OGS_FSM_STATE(&sess->sm));
+
+            /*
+             * Route Nchf responses that must not reach the session FSM.
+             *
+             * Only two states handle CHF responses: wait_5gc_nchf_create
+             * (Create) and operational (Update).  During release the session
+             * passes through states with no CHF arm - wait_5gc_n1_n2_release
+             * in particular ends its SBI-client switch in
+             * ogs_assert_if_reached() - and a CHF response is slow enough
+             * (the CHF writes a CDR and does two MongoDB operations first)
+             * to land in them.  Dispatching it there aborted the SMF.
+             */
+            if (service_name_id == OpenAPI_service_name_nchf_convergedcharging) {
+                const char *op = sbi_message.h.resource.component[2];
+
+                if (op && !strcmp(op, OGS_SBI_RESOURCE_NAME_RELEASE)) {
+                    /* The final Release needs no state machine: record the
+                     * outcome and clear the association, in whatever state
+                     * the session has reached. */
+                    smf_nchf_convergedcharging_handle_release(
+                            sess, &sbi_message);
+                    break;
+                }
+
+                if (op && !strcmp(op, OGS_SBI_RESOURCE_NAME_UPDATE) &&
+                        !OGS_FSM_CHECK(&sess->sm, smf_gsm_state_operational)) {
+                    /* The session started releasing while this Update was
+                     * out.  A refreshed grant is moot for a session being
+                     * torn down; the usage it carried is already on the
+                     * CHF.  Drop it instead of reaching a state that
+                     * cannot handle it. */
+                    ogs_warn("[%s:%d] CHF Update response after the session "
+                             "left operational — ignored",
+                             smf_ue->supi, sess->psi);
+                    sess->sm_data.nchf_update_in_flight = false;
+                    break;
+                }
+            }
 
             e->sess_id = sess->id;
             e->h.sbi.message = &sbi_message;
@@ -1356,6 +1444,13 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
             ogs_assert(sbi_object_id >= OGS_MIN_POOL_ID &&
                     sbi_object_id <= OGS_MAX_POOL_ID);
 
+            /* Gap 4 fix: save the service name before the xact is freed, so
+             * a timed-out CHF Update can release nchf_update_in_flight below.
+             * Only Update needs this: Create leaves the session in
+             * wait_5gc_nchf_create, and Release is fire-and-forget on a
+             * session that is already being torn down. */
+            xact_service_name = sbi_xact->service_name;
+
             ogs_sbi_xact_remove(sbi_xact);
 
             sess = smf_sess_find_by_id(sbi_object_id);
@@ -1373,6 +1468,15 @@ void smf_state_operational(ogs_fsm_t *s, smf_event_t *e)
                     ogs_sbi_server_send_error(stream,
                         OGS_SBI_HTTP_STATUS_GATEWAY_TIMEOUT, NULL,
                         "Cannot receive SBI message", smf_ue->supi, NULL));
+            }
+
+            if (xact_service_name ==
+                    OpenAPI_service_name_nchf_convergedcharging &&
+                    sess->sm_data.nchf_update_in_flight) {
+                ogs_warn("[%s:%d] CHF Update timed out — "
+                         "clearing nchf_update_in_flight",
+                         smf_ue->supi, sess->psi);
+                sess->sm_data.nchf_update_in_flight = false;
             }
             break;
 

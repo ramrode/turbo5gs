@@ -1,7 +1,7 @@
 /*
  * geographical_coordinates.h
  *
- * Geographical coordinates.
+ * 
  */
 
 #ifndef _OpenAPI_geographical_coordinates_H_
@@ -19,13 +19,17 @@ extern "C" {
 #endif
 
 struct OpenAPI_geographical_coordinates_s {
-    double lon;
-    double lat;
+    bool is_latitude;
+    int latitude;
+    bool is_longitude;
+    int longitude;
 };
 
 OpenAPI_geographical_coordinates_t *OpenAPI_geographical_coordinates_create(
-    double lon,
-    double lat
+    bool is_latitude,
+    int latitude,
+    bool is_longitude,
+    int longitude
 );
 void OpenAPI_geographical_coordinates_free(OpenAPI_geographical_coordinates_t *geographical_coordinates);
 OpenAPI_geographical_coordinates_t *OpenAPI_geographical_coordinates_parseFromJSON(cJSON *geographical_coordinatesJSON);

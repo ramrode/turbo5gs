@@ -16,7 +16,7 @@ typedef struct OpenAPI_service_experience_info_s OpenAPI_service_experience_info
 #include "addr_fqdn.h"
 #include "location_info.h"
 #include "network_area_info.h"
-#include "pdu_session_info_1.h"
+#include "pdu_session_info.h"
 #include "rat_freq_information.h"
 #include "service_experience_type.h"
 #include "snssai.h"
@@ -47,7 +47,7 @@ struct OpenAPI_service_experience_info_s {
     bool is_ratio;
     int ratio;
     struct OpenAPI_rat_freq_information_s *rat_freq;
-    struct OpenAPI_pdu_session_info_1_s *pdu_ses_info;
+    struct OpenAPI_pdu_session_info_s *pdu_ses_info;
 };
 
 OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_create(
@@ -70,7 +70,7 @@ OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_create(
     bool is_ratio,
     int ratio,
     OpenAPI_rat_freq_information_t *rat_freq,
-    OpenAPI_pdu_session_info_1_t *pdu_ses_info
+    OpenAPI_pdu_session_info_t *pdu_ses_info
 );
 void OpenAPI_service_experience_info_free(OpenAPI_service_experience_info_t *service_experience_info);
 OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_parseFromJSON(cJSON *service_experience_infoJSON);

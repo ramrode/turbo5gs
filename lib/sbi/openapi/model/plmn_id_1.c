@@ -47,22 +47,18 @@ cJSON *OpenAPI_plmn_id_1_convertToJSON(OpenAPI_plmn_id_1_t *plmn_id_1)
     }
 
     item = cJSON_CreateObject();
-    if (!plmn_id_1->mcc) {
-        ogs_error("OpenAPI_plmn_id_1_convertToJSON() failed [mcc]");
-        return NULL;
-    }
+    if (plmn_id_1->mcc) {
     if (cJSON_AddStringToObject(item, "mcc", plmn_id_1->mcc) == NULL) {
         ogs_error("OpenAPI_plmn_id_1_convertToJSON() failed [mcc]");
         goto end;
     }
-
-    if (!plmn_id_1->mnc) {
-        ogs_error("OpenAPI_plmn_id_1_convertToJSON() failed [mnc]");
-        return NULL;
     }
+
+    if (plmn_id_1->mnc) {
     if (cJSON_AddStringToObject(item, "mnc", plmn_id_1->mnc) == NULL) {
         ogs_error("OpenAPI_plmn_id_1_convertToJSON() failed [mnc]");
         goto end;
+    }
     }
 
 end:
@@ -76,28 +72,24 @@ OpenAPI_plmn_id_1_t *OpenAPI_plmn_id_1_parseFromJSON(cJSON *plmn_id_1JSON)
     cJSON *mcc = NULL;
     cJSON *mnc = NULL;
     mcc = cJSON_GetObjectItemCaseSensitive(plmn_id_1JSON, "mcc");
-    if (!mcc) {
+    if (mcc) {
+    if (!cJSON_IsString(mcc) && !cJSON_IsNull(mcc)) {
         ogs_error("OpenAPI_plmn_id_1_parseFromJSON() failed [mcc]");
         goto end;
     }
-    if (!cJSON_IsString(mcc)) {
-        ogs_error("OpenAPI_plmn_id_1_parseFromJSON() failed [mcc]");
-        goto end;
     }
 
     mnc = cJSON_GetObjectItemCaseSensitive(plmn_id_1JSON, "mnc");
-    if (!mnc) {
+    if (mnc) {
+    if (!cJSON_IsString(mnc) && !cJSON_IsNull(mnc)) {
         ogs_error("OpenAPI_plmn_id_1_parseFromJSON() failed [mnc]");
         goto end;
     }
-    if (!cJSON_IsString(mnc)) {
-        ogs_error("OpenAPI_plmn_id_1_parseFromJSON() failed [mnc]");
-        goto end;
     }
 
     plmn_id_1_local_var = OpenAPI_plmn_id_1_create (
-        ogs_strdup(mcc->valuestring),
-        ogs_strdup(mnc->valuestring)
+        mcc && !cJSON_IsNull(mcc) ? ogs_strdup(mcc->valuestring) : NULL,
+        mnc && !cJSON_IsNull(mnc) ? ogs_strdup(mnc->valuestring) : NULL
     );
 
     return plmn_id_1_local_var;

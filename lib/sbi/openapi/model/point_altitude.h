@@ -14,7 +14,7 @@
 #include "../include/binary.h"
 typedef struct OpenAPI_point_altitude_s OpenAPI_point_altitude_t;
 #include "gad_shape.h"
-#include "geographical_coordinates.h"
+#include "geographical_coordinates_1.h"
 #include "supported_gad_shapes.h"
 
 #ifdef __cplusplus
@@ -23,13 +23,13 @@ extern "C" {
 
 struct OpenAPI_point_altitude_s {
     OpenAPI_supported_gad_shapes_e shape;
-    struct OpenAPI_geographical_coordinates_s *point;
+    struct OpenAPI_geographical_coordinates_1_s *point;
     double altitude;
 };
 
 OpenAPI_point_altitude_t *OpenAPI_point_altitude_create(
     OpenAPI_supported_gad_shapes_e shape,
-    OpenAPI_geographical_coordinates_t *point,
+    OpenAPI_geographical_coordinates_1_t *point,
     double altitude
 );
 void OpenAPI_point_altitude_free(OpenAPI_point_altitude_t *point_altitude);

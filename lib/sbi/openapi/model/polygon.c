@@ -27,7 +27,7 @@ void OpenAPI_polygon_free(OpenAPI_polygon_t *polygon)
     }
     if (polygon->point_list) {
         OpenAPI_list_for_each(polygon->point_list, node) {
-            OpenAPI_geographical_coordinates_free(node->data);
+            OpenAPI_geographical_coordinates_1_free(node->data);
         }
         OpenAPI_list_free(polygon->point_list);
         polygon->point_list = NULL;
@@ -65,7 +65,7 @@ cJSON *OpenAPI_polygon_convertToJSON(OpenAPI_polygon_t *polygon)
         goto end;
     }
     OpenAPI_list_for_each(polygon->point_list, node) {
-        cJSON *itemLocal = OpenAPI_geographical_coordinates_convertToJSON(node->data);
+        cJSON *itemLocal = OpenAPI_geographical_coordinates_1_convertToJSON(node->data);
         if (itemLocal == NULL) {
             ogs_error("OpenAPI_polygon_convertToJSON() failed [point_list]");
             goto end;
@@ -114,7 +114,7 @@ OpenAPI_polygon_t *OpenAPI_polygon_parseFromJSON(cJSON *polygonJSON)
                 ogs_error("OpenAPI_polygon_parseFromJSON() failed [point_list]");
                 goto end;
             }
-            OpenAPI_geographical_coordinates_t *point_listItem = OpenAPI_geographical_coordinates_parseFromJSON(point_list_local);
+            OpenAPI_geographical_coordinates_1_t *point_listItem = OpenAPI_geographical_coordinates_1_parseFromJSON(point_list_local);
             if (!point_listItem) {
                 ogs_error("No point_listItem");
                 goto end;
@@ -131,7 +131,7 @@ OpenAPI_polygon_t *OpenAPI_polygon_parseFromJSON(cJSON *polygonJSON)
 end:
     if (point_listList) {
         OpenAPI_list_for_each(point_listList, node) {
-            OpenAPI_geographical_coordinates_free(node->data);
+            OpenAPI_geographical_coordinates_1_free(node->data);
         }
         OpenAPI_list_free(point_listList);
         point_listList = NULL;

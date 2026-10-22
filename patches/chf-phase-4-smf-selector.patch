@@ -1,0 +1,660 @@
+diff --git a/src/smf/context.c b/src/smf/context.c
+index 3086ce996..fbfdf33c9 100644
+--- a/src/smf/context.c
++++ b/src/smf/context.c
+@@ -65,6 +65,69 @@ int smf_use_gy_iface(void)
+     }
+ }
+ 
++/* smf_use_chf_iface() — 5GC counterpart to smf_use_gy_iface().
++ *
++ * Returns:
++ *   1  — CHF service is available (NRF subscription active for
++ *         nchf-convergedcharging).
++ *   0  — No CHF available; caller should skip online charging.
++ *  -1  — CHF explicitly enabled in config but not reachable (error).
++ *
++ * TS 29.513 §4.2.2 — SMF selects Nchf_ConvergedCharging for 5GC PDU
++ * sessions when online charging is configured.
++ * TS 23.503 §6.3   — CHF selection procedure.
++ */
++int smf_use_chf_iface(void)
++{
++    switch (smf_self()->ctf_config.enabled) {
++    case SMF_CTF_ENABLED_AUTO:
++        /* Probe the cached NF instance list: CHF is available when at least
++         * one CHF instance advertising nchf-convergedcharging has been
++         * discovered via the NRF subscription set up in smf_sbi_open(). */
++        return ogs_sbi_nf_instance_find_by_service(
++                OpenAPI_service_name_nchf_convergedcharging,
++                OpenAPI_nf_type_SMF) ? 1 : 0;
++    case SMF_CTF_ENABLED_YES:
++        return ogs_sbi_nf_instance_find_by_service(
++                OpenAPI_service_name_nchf_convergedcharging,
++                OpenAPI_nf_type_SMF) ? 1 : -1;
++    case SMF_CTF_ENABLED_NO:
++        return 0;
++    default:
++        return -1;
++    }
++}
++
++/* smf_select_online_charging() — choose the online charging interface for a
++ * PDU session (EPC or 5GC).
++ *
++ * Decision logic (TS 29.513 §4.2.2):
++ *   1. EPC sessions use the Gy/Ro interface → SMF_OC_IFACE_GY.
++ *      Gy peer availability is verified inside the SMF_OC_IFACE_GY
++ *      switch-case by smf_use_gy_iface().
++ *   2. For 5GC sessions, prefer Nchf_ConvergedCharging (CHF) when available.
++ *   3. Fall back to NONE if no online charging NF is reachable.
++ *
++ * Returns SMF_OC_IFACE_GY  for EPC sessions (Gy/Ro).
++ * Returns SMF_OC_IFACE_CHF when smf_use_chf_iface() is positive (5GC).
++ * Returns SMF_OC_IFACE_NONE when no charging interface is reachable.
++ */
++smf_online_charging_iface_e smf_select_online_charging(smf_sess_t *sess)
++{
++    ogs_assert(sess);
++
++    /* EPC sessions always route to the Gy/Ro interface.
++     * Gy peer availability is checked inside SMF_OC_IFACE_GY case. */
++    if (sess->epc)
++        return SMF_OC_IFACE_GY;
++
++    /* 5GC sessions prefer Nchf_ConvergedCharging. */
++    if (smf_use_chf_iface() > 0)
++        return SMF_OC_IFACE_CHF;
++
++    return SMF_OC_IFACE_NONE;
++}
++
+ void smf_context_init(void)
+ {
+     ogs_assert(context_initialized == 0);
+@@ -2120,6 +2183,51 @@ void smf_sess_remove(smf_sess_t *sess)
+     if (sess->s6b_sid)
+         ogs_free(sess->s6b_sid);
+ 
++    /*
++     * Cancel any Nchf transaction still outstanding on this session.
++     *
++     * The CHF Release issued at the wait_pfcp_deletion ENTRY action is
++     * deliberately fire-and-forget, so it runs alongside the teardown chain
++     * rather than inside it.  That chain is strictly sequential (PCF delete →
++     * UDM SDM delete → UDM UECM deregister → session_will_release), and the
++     * CHF answers only after writing a CDR file and two MongoDB operations,
++     * so the Release is routinely still in flight when the chain ends here.
++     *
++     * The transaction points back at sess->sbi.  Leaving it attached makes
++     * ogs_sbi_object_free() below log "SBI running [N]" and dump the request,
++     * and — once the response or the CLIENT_WAIT timeout finally arrives —
++     * ogs_sbi_xact_remove() unlinks it from an sbi_object that no longer
++     * exists.
++     *
++     * Dropping the transaction here discards only our interest in the 204:
++     * the request has already gone to the CHF, which writes the CDR and
++     * clears its own session either way.  A later response finds no
++     * transaction and is discarded by smf-sm.c.
++     *
++     * An outstanding Release is the normal case and is not worth a
++     * warning; anything else still in flight here is.
++     */
++    if (!sess->epc) {
++        ogs_sbi_xact_t *xact = NULL, *next_xact = NULL;
++
++        ogs_list_for_each_safe(&sess->sbi.xact_list, next_xact, xact) {
++            if (xact->service_name ==
++                    OpenAPI_service_name_nchf_convergedcharging) {
++                if (sess->sm_data.nchf_release_in_flight)
++                    ogs_debug("[%d] CHF Release response not awaited "
++                              "[xact:%d]", sess->psi, xact->id);
++                else
++                    ogs_warn("[%d] Cancelling in-flight CHF transaction at "
++                             "session removal", sess->psi);
++                ogs_sbi_xact_remove(xact);
++            }
++        }
++    }
++
++    CHF_CLEAR(sess);
++    if (sess->chf_association.client)
++        ogs_sbi_client_remove(sess->chf_association.client);
++
+     if (sess->session.name)
+         ogs_free(sess->session.name);
+     if (sess->full_dnn)
+@@ -2440,6 +2548,7 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
+     urr->vol_threshold.total_volume = 1024*1024*100;
+ 
+     ogs_pfcp_pdr_associate_urr(dl_pdr, urr);
++    ogs_pfcp_pdr_associate_urr(ul_pdr, urr);   /* GAP 4: count UL traffic too */
+ 
+     /* QER */
+     qer = ogs_pfcp_qer_add(&sess->pfcp);
+diff --git a/src/smf/context.h b/src/smf/context.h
+index 407c6a810..6641577f2 100644
+--- a/src/smf/context.h
++++ b/src/smf/context.h
+@@ -288,6 +288,25 @@ typedef struct smf_bearer_s {
+ } smf_bearer_t;
+ 
+ #define SMF_SESS(pfcp_sess) ogs_container_of(pfcp_sess, smf_sess_t, pfcp)
++/*
++ * Why the UPF sent a usage report, in the CHF's terms.
++ *
++ * Mapped from the PFCP Usage Report Trigger (TS 29.244 §8.2.35) and sent
++ * on as a TS 32.291 Trigger, so the CHF is told what happened rather than
++ * having to infer it from the numbers.  Kept separate from Gy's Diameter
++ * reporting reasons, which mean the same things in another protocol.
++ *
++ * The values are ordered by how much they demand of the CHF: when several
++ * reasons arrive in one batch of usage reports the highest one is sent.
++ */
++#define SMF_CHF_TRIGGER_NONE            0
++#define SMF_CHF_TRIGGER_QUOTA_HOLDING   1   /* idle; grant can go back    */
++#define SMF_CHF_TRIGGER_QUOTA_THRESHOLD 2   /* volume threshold reached   */
++#define SMF_CHF_TRIGGER_QUOTA_EXHAUSTED 3   /* the grant is used up       */
++#define SMF_CHF_TRIGGER_VALIDITY_TIME   4   /* the grant's timer expired  */
++#define SMF_CHF_TRIGGER_FORCED_REAUTH   5   /* the CHF asked (ChargingNotify) */
++#define SMF_CHF_TRIGGER_FINAL           6   /* the session is ending      */
++
+ typedef struct smf_sess_s {
+     ogs_sbi_object_t sbi;
+     ogs_pool_id_t id;
+@@ -313,6 +332,14 @@ typedef struct smf_sess_s {
+         uint32_t gy_cca_term_err; /* Gy CCA RXed error code */
+         bool s6b_str_in_flight; /* Waiting for S6B CCA */
+         uint32_t s6b_sta_err; /* S6B CCA RXed error code */
++        /* TS 29.513 §4.2.2 — Nchf_ConvergedCharging in-flight guards */
++        bool nchf_create_in_flight;  /* Waiting for CHF 201 Created    */
++        bool nchf_update_in_flight;  /* Waiting for CHF 200 OK (Update) */
++        bool nchf_release_in_flight; /* Waiting for CHF 204 No Content  */
++        bool fui_release_triggered;  /* Release queued after CHF FUI    */
++        uint8_t establishment_reject_cause; /* 5GSM cause for the reject,
++                                             * 0 = network failure        */
++        uint32_t establishment_reject_backoff; /* T3396 seconds, 0 = none */
+     } sm_data;
+ 
+     bool            epc;            /**< EPC or 5GC */
+@@ -458,6 +485,41 @@ typedef struct smf_sess_s {
+         ogs_sbi_client_t *client;
+     } data_change_subscription;
+ 
++    /* CHF (Nchf_ConvergedCharging) association.
++     * Created on successful POST /chargingdata (201 Created).
++     * Deleted on POST /chargingdata/{ref}/release.
++     * Only used for 5GC sessions (sess->epc == false).
++     * TS 32.291 §6.1 — ChargingDataRef resource URI as session key.
++     * TS 29.513 §4.2.2 — online charging for 5GC PDU sessions. */
++#define CHF_ASSOCIATED(__sESS) \
++    ((__sESS) && ((__sESS)->chf_association.ref))
++#define CHF_CLEAR(__sESS) \
++    do { \
++        ogs_assert((__sESS)); \
++        if ((__sESS)->chf_association.resource_uri) \
++            ogs_free((__sESS)->chf_association.resource_uri); \
++        (__sESS)->chf_association.resource_uri = NULL; \
++        if ((__sESS)->chf_association.ref) \
++            ogs_free((__sESS)->chf_association.ref); \
++        (__sESS)->chf_association.ref = NULL; \
++    } while(0)
++#define CHF_STORE(__sESS, __rESOURCE_URI, __rEF) \
++    do { \
++        ogs_assert((__sESS)); \
++        ogs_assert((__rESOURCE_URI)); \
++        ogs_assert((__rEF)); \
++        CHF_CLEAR(__sESS); \
++        (__sESS)->chf_association.resource_uri = ogs_strdup(__rESOURCE_URI); \
++        ogs_assert((__sESS)->chf_association.resource_uri); \
++        (__sESS)->chf_association.ref = ogs_strdup(__rEF); \
++        ogs_assert((__sESS)->chf_association.ref); \
++    } while(0)
++    struct {
++        char *resource_uri; /* Full /nchf-convergedcharging/v3/chargingdata/{ref} URI */
++        char *ref;          /* ChargingDataRef UUID (last path component) */
++        ogs_sbi_client_t *client; /* Cached CHF SBI client */
++    } chf_association;
++
+     OpenAPI_up_cnx_state_e up_cnx_state;
+ 
+     /* Serving PLMN ID & Home PLMN ID */
+@@ -608,8 +670,9 @@ typedef struct smf_sess_s {
+         uint64_t dl_octets;
+         ogs_time_t duration;
+         uint32_t reporting_reason; /* OGS_DIAM_GY_REPORTING_REASON_* */
+-        /* Whether Gy Final-Unit-Indication was received.
+-         * Triggers session release upon Rx of next PFCP Report Req */
++        /* Whether Gy/CHF Final-Unit-Indication was received.
++         * For 5GC/CHF: triggers immediate session teardown on Update response.
++         * For EPC/Gy: triggers session release on next PFCP Report Req. */
+         bool final_unit;
+         /* Snapshot of measurement when last report was sent: */
+         struct {
+@@ -619,6 +682,44 @@ typedef struct smf_sess_s {
+         } last_report;
+     } gy;
+ 
++    /*
++     * Nchf_ConvergedCharging accounting.
++     *
++     * Deliberately its own state rather than a share of gy above.  Gy is
++     * the EPC's Diameter interface and belongs to upstream; borrowing its
++     * counters meant every change here reached into code this work has no
++     * business touching, and an upstream change to Gy's accounting would
++     * quietly land in 5G charging.  The two now only have the PFCP usage
++     * reports in common, which is where they genuinely agree.
++     *
++     * Counters are cumulative for the session; last_report is the baseline
++     * that makes each CHF report a delta (TS 32.291 §6.3.2.2).
++     */
++    struct {
++        uint64_t ul_octets;
++        uint64_t dl_octets;
++        ogs_time_t duration;
++
++        struct {
++            uint64_t ul_octets;
++            uint64_t dl_octets;
++            ogs_time_t duration;
++        } last_report;
++
++        /* The CHF said this grant is the last one (FinalUnitIndication). */
++        bool final_unit;
++
++        /* Why the UPF reported, carried into the next Update as a
++         * TS 32.291 Trigger.  See SMF_CHF_TRIGGER_* below. */
++        uint8_t trigger;
++    } chf;
++
++    /* TS 32.291 §7.2.1.1 — per-session Nchf_ConvergedCharging sequence
++     * counter.  Incremented for each Update request so the CHF can detect
++     * missing or reordered messages within a single charging session.
++     * Starts at 0 (calloc); first Update uses ++nchf_seq == 1. */
++    uint32_t nchf_seq;
++
+     struct {
+         ogs_nas_extended_protocol_configuration_options_t ue_epco;
+     } nas; /* Saved from NAS-5GS */
+@@ -736,6 +837,19 @@ typedef struct smf_sess_s {
+ 
+ } smf_sess_t;
+ 
++/* Log-safe accessors used by the Nchf_ConvergedCharging build/handle paths.
++ * Both fields are legitimately absent at some points in the session
++ * lifetime, and every CHF log line needs a printable fallback. */
++static ogs_inline const char *smf_nchf_dnn(const smf_sess_t *sess)
++{
++    return (sess && sess->session.name) ? sess->session.name : "?";
++}
++
++static ogs_inline const char *smf_nchf_ref(const smf_sess_t *sess)
++{
++    return CHF_ASSOCIATED(sess) ? sess->chf_association.ref : "(none)";
++}
++
+ void smf_context_init(void);
+ void smf_context_final(void);
+ smf_context_t *smf_self(void);
+@@ -744,6 +858,28 @@ int smf_context_parse_config(void);
+ 
+ int smf_use_gy_iface(void);
+ 
++/* Online charging interface selector.
++ *
++ * smf_select_online_charging() selects the online charging interface for any
++ * PDU session (EPC or 5GC):
++ *   - Returns SMF_OC_IFACE_GY   for EPC sessions (Gy/Ro).
++ *   - Returns SMF_OC_IFACE_CHF  for 5GC sessions when CHF is reachable.
++ *   - Returns SMF_OC_IFACE_NONE when no online charging is available.
++ *
++ * smf_use_chf_iface() is the 5GC equivalent of smf_use_gy_iface():
++ *   returns non-zero when the SMF should use Nchf_ConvergedCharging.
++ *
++ * TS 29.513 §4.2.2 — Online charging selection in 5GC.
++ * TS 23.503 §6.3   — CHF selection procedure. */
++typedef enum {
++    SMF_OC_IFACE_NONE = 0,
++    SMF_OC_IFACE_CHF,       /* Nchf_ConvergedCharging (5GC) — TS 32.291 */
++    SMF_OC_IFACE_GY,        /* Gy/Ro (EPC) — kept for reference only    */
++} smf_online_charging_iface_e;
++
++smf_online_charging_iface_e smf_select_online_charging(smf_sess_t *sess);
++int smf_use_chf_iface(void);
++
+ smf_gtp_node_t *smf_gtp_node_new(ogs_gtp_node_t *gnode);
+ void smf_gtp_node_free(smf_gtp_node_t *smf_gnode);
+ 
+diff --git a/src/smf/n4-handler.c b/src/smf/n4-handler.c
+index 563edbd6f..154116697 100644
+--- a/src/smf/n4-handler.c
++++ b/src/smf/n4-handler.c
+@@ -26,6 +26,15 @@
+ #include "sbi-path.h"
+ #include "ngap-path.h"
+ #include "fd-path.h"
++#include "nchf-build.h"
++
++/* CHF accounting, defined below next to the Gy handlers they sit beside. */
++static void chf_accumulate_deletion_usage(
++        smf_sess_t *sess, ogs_pfcp_session_deletion_response_t *rsp);
++static void chf_accumulate_report_usage(
++        smf_sess_t *sess, ogs_pfcp_session_report_request_t *pfcp_req);
++static bool chf_handle_usage_report(
++        smf_sess_t *sess, ogs_pfcp_session_report_request_t *pfcp_req);
+ 
+ uint8_t gtp_cause_from_pfcp(uint8_t pfcp_cause, uint8_t gtp_version)
+ {
+@@ -1162,6 +1171,13 @@ int smf_5gc_n4_handle_session_deletion_response(
+         return status;
+     }
+ 
++    /*
++     * Bank the UPF's final usage before anyone charges from it.  This used
++     * to be skipped for 5GC, so the last interval of every session -
++     * everything since the previous periodic report - never reached the CHF.
++     */
++    chf_accumulate_deletion_usage(sess, rsp);
++
+     return status;
+ }
+ 
+@@ -1572,6 +1588,17 @@ void smf_epc_n4_handle_session_modification_response(
+     }
+ }
+ 
++/*
++ * Fold the UPF's final Usage Report(s) from a PFCP Session Deletion
++ * Response into the session's usage counters.
++ *
++ * The deletion response is the last usage the UPF will ever report for the
++ * session: everything since the previous periodic report arrives here and
++ * nowhere else.  Both the EPC path (Gy CCR-T) and the 5GC path (Nchf
++ * Release) charge from these counters, and both must send their final
++ * charging request only AFTER this has run.
++ */
++/* ------------------------------------------------------------------ */
+ uint8_t smf_epc_n4_handle_session_deletion_response(
+         smf_sess_t *sess, ogs_pfcp_xact_t *xact,
+         ogs_pfcp_session_deletion_response_t *rsp)
+@@ -1633,12 +1660,222 @@ uint8_t smf_epc_n4_handle_session_deletion_response(
+     return OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/* CHF accounting                                                       */
++/*                                                                      */
++/* The CHF keeps its own counters (smf_sess_t.chf), separate from the    */
++/* Gy ones: Gy is the EPC's Diameter interface and is upstream's.  These */
++/* helpers read the same PFCP usage reports and add them to the CHF's    */
++/* side, and note why the UPF reported so the next Update can say so     */
++/* (TS 32.291 Trigger).                                                  */
++/* ------------------------------------------------------------------ */
++
++/* PFCP Usage Report Trigger (TS 29.244 §8.2.35) -> the CHF's terms. */
++static uint8_t chf_trigger_from_pfcp(
++        const ogs_pfcp_usage_report_trigger_t *rep_trig)
++{
++    ogs_assert(rep_trig);
++
++    /* Exhaustion first: when a report carries both, the grant is gone. */
++    if (rep_trig->volume_quota || rep_trig->time_quota)
++        return SMF_CHF_TRIGGER_QUOTA_EXHAUSTED;
++    if (rep_trig->volume_threshold || rep_trig->time_threshold)
++        return SMF_CHF_TRIGGER_QUOTA_THRESHOLD;
++    if (rep_trig->quota_validity_time)
++        return SMF_CHF_TRIGGER_VALIDITY_TIME;
++    if (rep_trig->termination_report)
++        return SMF_CHF_TRIGGER_FINAL;
++    /* Idle: the UPF saw no traffic for the quota holding time, so what is
++     * left of the grant can go back to the cycle. */
++    if (rep_trig->quota_holding_time)
++        return SMF_CHF_TRIGGER_QUOTA_HOLDING;
++
++    return SMF_CHF_TRIGGER_NONE;
++}
++
++static void chf_accumulate_deletion_usage(
++        smf_sess_t *sess, ogs_pfcp_session_deletion_response_t *rsp)
++{
++    smf_bearer_t *bearer = NULL;
++    unsigned int i;
++
++    ogs_assert(sess);
++    ogs_assert(rsp);
++
++    bearer = smf_default_bearer_in_sess(sess);
++    for (i = 0; i < OGS_ARRAY_SIZE(rsp->usage_report); i++) {
++        ogs_pfcp_tlv_usage_report_session_deletion_response_t *use_rep =
++            &rsp->usage_report[i];
++        uint32_t urr_id;
++        int16_t decoded;
++        ogs_pfcp_volume_measurement_t volume;
++
++        if (use_rep->presence == 0)
++            break;
++        if (use_rep->urr_id.presence == 0)
++            continue;
++        urr_id = use_rep->urr_id.u32;
++        if (!bearer || !bearer->urr || bearer->urr->id != urr_id)
++            continue;
++        decoded = ogs_pfcp_parse_volume_measurement(
++                &volume, &use_rep->volume_measurement);
++        if (use_rep->volume_measurement.len != decoded) {
++            ogs_error("Invalid Volume Measurement");
++            continue;
++        }
++
++        if (volume.ulvol)
++            sess->chf.ul_octets += volume.uplink_volume;
++        if (volume.dlvol)
++            sess->chf.dl_octets += volume.downlink_volume;
++        sess->chf.duration += use_rep->duration_measurement.u32;
++    }
++
++    /* The session is ending, whatever the UPF gave as the trigger. */
++    sess->chf.trigger = SMF_CHF_TRIGGER_FINAL;
++}
++
++static void chf_accumulate_report_usage(
++        smf_sess_t *sess, ogs_pfcp_session_report_request_t *pfcp_req)
++{
++    smf_bearer_t *bearer = NULL;
++    unsigned int i;
++
++    ogs_assert(sess);
++    ogs_assert(pfcp_req);
++
++    bearer = smf_default_bearer_in_sess(sess);
++    for (i = 0; i < OGS_ARRAY_SIZE(pfcp_req->usage_report); i++) {
++        ogs_pfcp_tlv_usage_report_session_report_request_t *use_rep =
++            &pfcp_req->usage_report[i];
++        uint32_t urr_id;
++        int16_t decoded;
++        ogs_pfcp_volume_measurement_t volume;
++        ogs_pfcp_usage_report_trigger_t rep_trig;
++        uint8_t trigger;
++
++        if (use_rep->presence == 0)
++            break;
++        if (use_rep->urr_id.presence == 0)
++            continue;
++        urr_id = use_rep->urr_id.u32;
++        if (!bearer || !bearer->urr || bearer->urr->id != urr_id)
++            continue;
++        decoded = ogs_pfcp_parse_volume_measurement(
++                &volume, &use_rep->volume_measurement);
++        if (use_rep->volume_measurement.len != decoded) {
++            ogs_error("Invalid Volume Measurement");
++            continue;
++        }
++
++        if (volume.ulvol)
++            sess->chf.ul_octets += volume.uplink_volume;
++        if (volume.dlvol)
++            sess->chf.dl_octets += volume.downlink_volume;
++        sess->chf.duration += use_rep->duration_measurement.u32;
++
++        ogs_pfcp_parse_usage_report_trigger(
++                &rep_trig, &use_rep->usage_report_trigger);
++        trigger = chf_trigger_from_pfcp(&rep_trig);
++        /* Several reports can arrive together; the strongest reason wins,
++         * and the order of SMF_CHF_TRIGGER_* is that of severity. */
++        if (trigger > sess->chf.trigger)
++            sess->chf.trigger = trigger;
++    }
++}
++
++/*
++ * A usage report on a session the CHF charges.
++ *
++ * Returns true when the session has to go: the CHF has already said this
++ * grant was the last one, so there is nothing left to ask for.
++ */
++static bool chf_handle_usage_report(
++        smf_sess_t *sess, ogs_pfcp_session_report_request_t *pfcp_req)
++{
++    smf_ue_t *smf_ue = NULL;
++    int r;
++
++    ogs_assert(sess);
++    ogs_assert(pfcp_req);
++
++    smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
++    ogs_assert(smf_ue);
++
++    chf_accumulate_report_usage(sess, pfcp_req);
++
++    if (sess->chf.final_unit) {
++        ogs_debug("[%s:%s] PFCP report after CHF Final Unit Indication",
++                  smf_ue->imsi_bcd, sess->session.name);
++        return true;
++    }
++
++    /*
++     * Keep at most one CHF Update outstanding per session.  TS 32.291
++     * §6.3.2.2 assumes sequential delivery - there is a single
++     * localSequenceNumber per charging session - so overlapping Updates
++     * could reach the CHF out of order.
++     *
++     * Skipping is safe for accounting: build_usage_report() advances
++     * chf.last_report when the request is built, so the octets reported
++     * here stay in the baseline and are billed by the next Update rather
++     * than lost or double-counted.
++     */
++    if (sess->sm_data.nchf_update_in_flight) {
++        ogs_debug("[%s:%s] CHF Update already in-flight — "
++                  "usage deferred to the next Update",
++                  smf_ue->imsi_bcd, sess->session.name);
++        return false;
++    }
++
++    sess->sm_data.nchf_update_in_flight = true;
++    r = smf_sbi_discover_and_send(
++            OpenAPI_service_name_nchf_convergedcharging, NULL,
++            smf_nchf_convergedcharging_build_update,
++            sess, NULL, 0, NULL);
++    ogs_expect(r == OGS_OK);
++
++    return false;
++}
++
+ /*
+- * Returns true when the report requires the session to be released
+- * (Gy Final-Unit-Indication or no Gy peer).  A malformed or otherwise
+- * rejected report is answered with an error response but never releases
+- * the session, so it returns false.
++ * A Session Report Request that arrives while the session is being deleted.
++ *
++ * The UPF can send one at any point before it processes the deletion: a
++ * volume threshold or quota crossed by the last packets, a validity timer,
++ * or - on a CHF Final-Unit teardown - the report provoked by the URR update
++ * that preceded it.  TS 29.244 requires a response, and the usage it carries
++ * must still be billed.
++ *
++ * Only the usage is taken.  Nothing else a report can ask for applies to a
++ * session that is going away: no CHF Update or Gy CCR (the final Release or
++ * CCR-T is sent after the deletion response and will include this usage),
++ * no paging for downlink data, no re-routing for an Error Indication.
+  */
++void smf_n4_handle_session_report_request_in_deletion(
++        smf_sess_t *sess, ogs_pfcp_xact_t *pfcp_xact,
++        ogs_pfcp_session_report_request_t *pfcp_req)
++{
++    ogs_assert(sess);
++    ogs_assert(pfcp_xact);
++    ogs_assert(pfcp_req);
++
++    if (pfcp_req->report_type.presence == 0) {
++        ogs_error("No Report Type");
++        ogs_pfcp_send_error_message(pfcp_xact, 0,
++                OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
++                OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
++                OGS_PFCP_REPORT_TYPE_TYPE);
++        return;
++    }
++
++    chf_accumulate_report_usage(sess, pfcp_req);
++
++    ogs_assert(OGS_OK ==
++        smf_pfcp_send_session_report_response(
++            pfcp_xact, sess, OGS_PFCP_CAUSE_REQUEST_ACCEPTED));
++}
++
+ bool smf_n4_handle_session_report_request(
+         smf_sess_t *sess, ogs_pfcp_xact_t *pfcp_xact,
+         ogs_pfcp_session_report_request_t *pfcp_req)
+@@ -1847,6 +2084,15 @@ bool smf_n4_handle_session_report_request(
+             sess->gy.reporting_reason =
+                 smf_pfcp_urr_usage_report_trigger2diam_gy_reporting_reason(&rep_trig);
+         }
++        /*
++         * TS 29.513 §5.2.2 — which online charging interface this session
++         * uses.  A 5GC session charged by the CHF is handled here and
++         * returns; Gy's own block below is upstream's, and is left exactly
++         * as upstream wrote it.
++         */
++        if (smf_select_online_charging(sess) == SMF_OC_IFACE_CHF)
++            release_session = chf_handle_usage_report(sess, pfcp_req);
++        else
+         switch (smf_use_gy_iface()) {
+         case 1:
+             if (!sess->gy.final_unit) {
+@@ -1854,16 +2100,19 @@ bool smf_n4_handle_session_report_request(
+                         sess, pfcp_xact->id,
+                         OGS_DIAM_GY_CC_REQUEST_TYPE_UPDATE_REQUEST);
+             } else {
+-                ogs_debug("[%s:%s] Rx PFCP report after Gy Final Unit Indication",
+-                          smf_ue->imsi_bcd, sess->session.name);
++                ogs_debug("[%s:%s] PFCP report after Gy Final Unit "
++                          "Indication", smf_ue->imsi_bcd,
++                          sess->session.name);
+                 release_session = true;
+             }
+             break;
+         case -1:
+-            ogs_error("No Gy Diameter Peer");
++            ogs_error("[%s:%s] No Gy Diameter Peer",
++                      smf_ue->imsi_bcd, sess->session.name);
+             release_session = true;
+             break;
+-        /* default: continue below */
++        default:
++            break;
+         }
+     }
+ 
+diff --git a/src/smf/n4-handler.h b/src/smf/n4-handler.h
+index 458fa114b..ee91e1e93 100644
+--- a/src/smf/n4-handler.h
++++ b/src/smf/n4-handler.h
+@@ -47,6 +47,9 @@ uint8_t smf_epc_n4_handle_session_deletion_response(
+         smf_sess_t *sess, ogs_pfcp_xact_t *xact,
+         ogs_pfcp_session_deletion_response_t *rsp);
+ 
++void smf_n4_handle_session_report_request_in_deletion(
++        smf_sess_t *sess, ogs_pfcp_xact_t *pfcp_xact,
++        ogs_pfcp_session_report_request_t *pfcp_req);
+ bool smf_n4_handle_session_report_request(
+         smf_sess_t *sess, ogs_pfcp_xact_t *pfcp_xact,
+         ogs_pfcp_session_report_request_t *pfcp_req);

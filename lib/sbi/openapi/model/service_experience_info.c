@@ -24,7 +24,7 @@ OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_create(
     bool is_ratio,
     int ratio,
     OpenAPI_rat_freq_information_t *rat_freq,
-    OpenAPI_pdu_session_info_1_t *pdu_ses_info
+    OpenAPI_pdu_session_info_t *pdu_ses_info
 )
 {
     OpenAPI_service_experience_info_t *service_experience_info_local_var = ogs_malloc(sizeof(OpenAPI_service_experience_info_t));
@@ -116,7 +116,7 @@ void OpenAPI_service_experience_info_free(OpenAPI_service_experience_info_t *ser
         service_experience_info->rat_freq = NULL;
     }
     if (service_experience_info->pdu_ses_info) {
-        OpenAPI_pdu_session_info_1_free(service_experience_info->pdu_ses_info);
+        OpenAPI_pdu_session_info_free(service_experience_info->pdu_ses_info);
         service_experience_info->pdu_ses_info = NULL;
     }
     ogs_free(service_experience_info);
@@ -300,7 +300,7 @@ cJSON *OpenAPI_service_experience_info_convertToJSON(OpenAPI_service_experience_
     }
 
     if (service_experience_info->pdu_ses_info) {
-    cJSON *pdu_ses_info_local_JSON = OpenAPI_pdu_session_info_1_convertToJSON(service_experience_info->pdu_ses_info);
+    cJSON *pdu_ses_info_local_JSON = OpenAPI_pdu_session_info_convertToJSON(service_experience_info->pdu_ses_info);
     if (pdu_ses_info_local_JSON == NULL) {
         ogs_error("OpenAPI_service_experience_info_convertToJSON() failed [pdu_ses_info]");
         goto end;
@@ -346,7 +346,7 @@ OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_parseFromJSON
     cJSON *rat_freq = NULL;
     OpenAPI_rat_freq_information_t *rat_freq_local_nonprim = NULL;
     cJSON *pdu_ses_info = NULL;
-    OpenAPI_pdu_session_info_1_t *pdu_ses_info_local_nonprim = NULL;
+    OpenAPI_pdu_session_info_t *pdu_ses_info_local_nonprim = NULL;
     svc_exprc = cJSON_GetObjectItemCaseSensitive(service_experience_infoJSON, "svcExprc");
     if (!svc_exprc) {
         ogs_error("OpenAPI_service_experience_info_parseFromJSON() failed [svc_exprc]");
@@ -515,9 +515,9 @@ OpenAPI_service_experience_info_t *OpenAPI_service_experience_info_parseFromJSON
 
     pdu_ses_info = cJSON_GetObjectItemCaseSensitive(service_experience_infoJSON, "pduSesInfo");
     if (pdu_ses_info) {
-    pdu_ses_info_local_nonprim = OpenAPI_pdu_session_info_1_parseFromJSON(pdu_ses_info);
+    pdu_ses_info_local_nonprim = OpenAPI_pdu_session_info_parseFromJSON(pdu_ses_info);
     if (!pdu_ses_info_local_nonprim) {
-        ogs_error("OpenAPI_pdu_session_info_1_parseFromJSON failed [pdu_ses_info]");
+        ogs_error("OpenAPI_pdu_session_info_parseFromJSON failed [pdu_ses_info]");
         goto end;
     }
     }
@@ -586,7 +586,7 @@ end:
         rat_freq_local_nonprim = NULL;
     }
     if (pdu_ses_info_local_nonprim) {
-        OpenAPI_pdu_session_info_1_free(pdu_ses_info_local_nonprim);
+        OpenAPI_pdu_session_info_free(pdu_ses_info_local_nonprim);
         pdu_ses_info_local_nonprim = NULL;
     }
     return NULL;

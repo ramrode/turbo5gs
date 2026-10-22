@@ -1,0 +1,702 @@
+diff --git a/lib/pfcp/build.c b/lib/pfcp/build.c
+index ed543471f..21ea9694f 100644
+--- a/lib/pfcp/build.c
++++ b/lib/pfcp/build.c
+@@ -762,7 +762,8 @@ void ogs_pfcp_build_update_urr(
+              OGS_PFCP_MODIFY_URR_VOLUME_QUOTA|
+              OGS_PFCP_MODIFY_URR_TIME_THRESH|
+              OGS_PFCP_MODIFY_URR_TIME_QUOTA|
+-             OGS_PFCP_MODIFY_URR_QUOTA_VALIDITY_TIME));
++             OGS_PFCP_MODIFY_URR_QUOTA_VALIDITY_TIME|
++             OGS_PFCP_MODIFY_URR_QUOTA_HOLDING_TIME));
+ 
+     /* Change request: Send only changed IEs */
+     message->presence = 1;
+@@ -819,6 +820,13 @@ void ogs_pfcp_build_update_urr(
+             message->quota_validity_time.u32 = urr->quota_validity_time;
+         }
+     }
++
++    if (modify_flags & OGS_PFCP_MODIFY_URR_QUOTA_HOLDING_TIME) {
++        if (urr->quota_holding_time) {
++            message->quota_holding_time.presence = 1;
++            message->quota_holding_time.u32 = urr->quota_holding_time;
++        }
++    }
+ }
+ 
+ static struct {
+diff --git a/lib/pfcp/xact.h b/lib/pfcp/xact.h
+index bbdb879d2..419b1da03 100644
+--- a/lib/pfcp/xact.h
++++ b/lib/pfcp/xact.h
+@@ -118,6 +118,7 @@ typedef struct ogs_pfcp_xact_s {
+ #define OGS_PFCP_MODIFY_URR_TIME_QUOTA ((uint64_t)1<<32)
+ #define OGS_PFCP_MODIFY_URR_VOLUME_THRESH ((uint64_t)1<<33)
+ #define OGS_PFCP_MODIFY_URR_TIME_THRESH ((uint64_t)1<<34)
++#define OGS_PFCP_MODIFY_URR_QUOTA_HOLDING_TIME ((uint64_t)1<<35)
+     uint64_t        modify_flags;
+ 
+ #define OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED 1
+diff --git a/lib/sbi/context.c b/lib/sbi/context.c
+index 62b0ef24c..d9f1307a9 100644
+--- a/lib/sbi/context.c
++++ b/lib/sbi/context.c
+@@ -1761,6 +1761,34 @@ static void sepp_info_free(ogs_sbi_sepp_info_t *sepp_info)
+ {
+ }
+ 
++/* TS 29.510 §6.1.6.2.9 — release dynamically allocated supi/gpsi range strings */
++static void chf_info_free(ogs_sbi_chf_info_t *chf_info)
++{
++    int i;
++
++    ogs_assert(chf_info);
++
++    for (i = 0; i < chf_info->num_of_supi_range; i++) {
++        if (chf_info->supi_range[i].start)
++            ogs_free(chf_info->supi_range[i].start);
++        if (chf_info->supi_range[i].end)
++            ogs_free(chf_info->supi_range[i].end);
++        if (chf_info->supi_range[i].pattern)
++            ogs_free(chf_info->supi_range[i].pattern);
++    }
++    chf_info->num_of_supi_range = 0;
++
++    for (i = 0; i < chf_info->num_of_gpsi_range; i++) {
++        if (chf_info->gpsi_range[i].start)
++            ogs_free(chf_info->gpsi_range[i].start);
++        if (chf_info->gpsi_range[i].end)
++            ogs_free(chf_info->gpsi_range[i].end);
++        if (chf_info->gpsi_range[i].pattern)
++            ogs_free(chf_info->gpsi_range[i].pattern);
++    }
++    chf_info->num_of_gpsi_range = 0;
++}
++
+ void ogs_sbi_nf_info_remove(ogs_list_t *list, ogs_sbi_nf_info_t *nf_info)
+ {
+     ogs_assert(list);
+@@ -1781,6 +1809,9 @@ void ogs_sbi_nf_info_remove(ogs_list_t *list, ogs_sbi_nf_info_t *nf_info)
+     case OpenAPI_nf_type_SEPP:
+         sepp_info_free(&nf_info->sepp);
+         break;
++    case OpenAPI_nf_type_CHF:
++        chf_info_free(&nf_info->chf);
++        break;
+     default:
+         ogs_fatal("Not implemented NF-type[%s]",
+                 OpenAPI_nf_type_ToString(nf_info->nf_type));
+@@ -1892,6 +1923,34 @@ bool ogs_sbi_check_smf_info_tai(
+     return false;
+ }
+ 
++bool ogs_sbi_check_chf_info_supi_range(
++        ogs_sbi_chf_info_t *chf, const char *supi)
++{
++    int i;
++
++    ogs_assert(chf);
++    ogs_assert(supi);
++
++    /* No restriction — match all SUPIs */
++    if (chf->num_of_supi_range == 0)
++        return true;
++
++    for (i = 0; i < chf->num_of_supi_range; i++) {
++        if (chf->supi_range[i].start && chf->supi_range[i].end) {
++            if (strcmp(supi, chf->supi_range[i].start) >= 0 &&
++                strcmp(supi, chf->supi_range[i].end) <= 0)
++                return true;
++        } else if (chf->supi_range[i].pattern) {
++            /* Prefix match — full regex deferred to future phase */
++            size_t plen = strlen(chf->supi_range[i].pattern);
++            if (strncmp(supi, chf->supi_range[i].pattern, plen) == 0)
++                return true;
++        }
++    }
++
++    return false;
++}
++
+ void ogs_sbi_nf_instance_build_default(ogs_sbi_nf_instance_t *nf_instance)
+ {
+     ogs_sbi_server_t *server = NULL;
+@@ -2180,6 +2239,9 @@ bool ogs_sbi_discovery_option_is_matched(
+     bool need_smf_slice = false;   /* requires both S-NSSAI and DNN */
+     bool need_smf_tai = false;     /* TAI filter present */
+     bool need_smf_any = false;     /* any SMF-specific filter */
++    bool chf_info_checked = false;
++    bool chf_match_found = false;
++    bool need_chf_supi = false;    /* SUPI filter present */
+     int i;
+ 
+     ogs_assert(nf_instance);
+@@ -2248,6 +2310,10 @@ bool ogs_sbi_discovery_option_is_matched(
+         need_smf_any = (need_smf_slice || need_smf_tai) ? true : false;
+     }
+ 
++    /* Determine which CHF filters are requested */
++    if (nf_instance->nf_type == OpenAPI_nf_type_CHF)
++        need_chf_supi = discovery_option->supi ? true : false;
++
+     /* --------------------------------------------------------------
+      * Step 2. NF-type specific matching
+      * -------------------------------------------------------------- */
+@@ -2302,11 +2368,29 @@ bool ogs_sbi_discovery_option_is_matched(
+             break; /* OR logic across smfInfo blocks */
+         }
+ 
++        /* --- CHF: TS 29.510 §6.2.6.2.4 — SUPI-range filter --- */
++        else if (nf_info->nf_type == OpenAPI_nf_type_CHF) {
++            chf_info_checked = true;
++
++            if (need_chf_supi &&
++                ogs_sbi_check_chf_info_supi_range(
++                        &nf_info->chf, discovery_option->supi) == false)
++                continue; /* this chfInfo does not cover the SUPI */
++
++            chf_match_found = true;
++            break; /* OR logic across chfInfo blocks */
++        }
++
+         /* Other NF types: no additional checks here */
+     }
+ 
+     /* --------------------------------------------------------------
+-     * Step 3. Final validation for SMF
++     * Step 3. Final validation for SMF / CHF
++     *
++     * Both filters are OR across their info blocks: an instance matches
++     * when ANY registered smfInfo / chfInfo satisfies the request.  Reject
++     * only when the filter was requested, at least one block was present,
++     * and none of them matched.
+      * -------------------------------------------------------------- */
+     if (nf_instance->nf_type == OpenAPI_nf_type_SMF &&
+         smf_info_checked &&
+@@ -2314,6 +2398,12 @@ bool ogs_sbi_discovery_option_is_matched(
+         smf_match_found == false)
+         return false;
+ 
++    if (nf_instance->nf_type == OpenAPI_nf_type_CHF &&
++        chf_info_checked &&
++        need_chf_supi &&
++        chf_match_found == false)
++        return false;
++
+     return true;
+ }
+ 
+diff --git a/lib/sbi/context.h b/lib/sbi/context.h
+index 231a34120..09f5ac926 100644
+--- a/lib/sbi/context.h
++++ b/lib/sbi/context.h
+@@ -30,6 +30,7 @@ extern "C" {
+ 
+ #define OGS_MAX_NUM_OF_NF_INFO 8
+ #define OGS_MAX_NUM_OF_SCP_DOMAIN 8
++#define OGS_MAX_NUM_OF_SUPI_RANGE 16    /* TS 29.510 §6.1.6.2.9 */
+ 
+ typedef struct ogs_sbi_client_s ogs_sbi_client_t;
+ typedef struct ogs_sbi_smf_info_s ogs_sbi_smf_info_t;
+@@ -493,6 +494,23 @@ typedef struct ogs_sbi_amf_info_s {
+     } nr_tai_range[OGS_MAX_NUM_OF_TAI];
+ } ogs_sbi_amf_info_t;
+ 
++/* TS 29.510 §6.1.6.2.9 — ChfInfo */
++typedef struct ogs_sbi_chf_info_s {
++    int num_of_supi_range;
++    struct {
++        char *start;
++        char *end;
++        char *pattern;
++    } supi_range[OGS_MAX_NUM_OF_SUPI_RANGE];
++
++    int num_of_gpsi_range;
++    struct {
++        char *start;
++        char *end;
++        char *pattern;
++    } gpsi_range[OGS_MAX_NUM_OF_SUPI_RANGE];
++} ogs_sbi_chf_info_t;
++
+ typedef struct ogs_sbi_nf_info_s {
+     ogs_lnode_t lnode;
+ 
+@@ -502,6 +520,7 @@ typedef struct ogs_sbi_nf_info_s {
+         ogs_sbi_amf_info_t amf;
+         ogs_sbi_scp_info_t scp;
+         ogs_sbi_sepp_info_t sepp;
++        ogs_sbi_chf_info_t chf;   /* TS 29.510 §6.1.6.2.9 */
+     };
+ } ogs_sbi_nf_info_t;
+ 
+@@ -574,6 +593,8 @@ bool ogs_sbi_check_smf_info_slice(
+         ogs_sbi_smf_info_t *smf_info, ogs_s_nssai_t *s_nssai, char *dnn);
+ bool ogs_sbi_check_smf_info_tai(
+         ogs_sbi_smf_info_t *smf_info, ogs_5gs_tai_t *tai);
++bool ogs_sbi_check_chf_info_supi_range(
++        ogs_sbi_chf_info_t *chf, const char *supi);
+ 
+ void ogs_sbi_nf_instance_build_default(ogs_sbi_nf_instance_t *nf_instance);
+ ogs_sbi_nf_service_t *ogs_sbi_nf_service_build_default(
+diff --git a/lib/sbi/message.c b/lib/sbi/message.c
+index 6c1481b38..9f25eaacb 100644
+--- a/lib/sbi/message.c
++++ b/lib/sbi/message.c
+@@ -194,6 +194,12 @@ void ogs_sbi_message_free(ogs_sbi_message_t *message)
+         OpenAPI_am_policy_data_free(message->AmPolicyData);
+     if (message->SmPolicyContextData)
+         OpenAPI_sm_policy_context_data_free(message->SmPolicyContextData);
++    if (message->ChargingDataRequest)
++        OpenAPI_charging_data_request_free(message->ChargingDataRequest);
++    if (message->ChargingDataResponse)
++        OpenAPI_charging_data_response_free(message->ChargingDataResponse);
++    if (message->ChargingNotifyRequest)
++        OpenAPI_charging_notify_request_free(message->ChargingNotifyRequest);
+     if (message->SmPolicyDecision)
+         OpenAPI_sm_policy_decision_free(message->SmPolicyDecision);
+     if (message->SmPolicyData)
+@@ -577,6 +583,10 @@ ogs_sbi_request_t *ogs_sbi_build_request(const ogs_sbi_message_t *message)
+             ogs_sbi_header_set(request->http.params,
+                     OGS_SBI_PARAM_HNRF_URI, discovery_option->hnrf_uri);
+         }
++        if (discovery_option->supi) {
++            ogs_sbi_header_set(request->http.params,
++                    OGS_SBI_PARAM_SUPI, discovery_option->supi);
++        }
+         if (discovery_option->requester_features) {
+             char *v = ogs_uint64_to_string(
+                     discovery_option->requester_features);
+@@ -1269,6 +1279,19 @@ int ogs_sbi_parse_request(
+             message->param.pei = ogs_hash_this_val(hi);
+         } else if (!strcmp(ogs_hash_this_key(hi), OGS_SBI_PARAM_SUPI)) {
+             message->param.supi = ogs_hash_this_val(hi);
++            /*
++             * The same "supi" query parameter serves two readers: N5g-eir
++             * reads message->param.supi directly, while nnrf-disc needs it
++             * on the discovery option so the NRF can apply a CHF's
++             * supiRangeList (TS 29.510 §6.2.6.2.10).  Populate both from
++             * this one arm — a second "supi" arm elsewhere in this chain
++             * would be unreachable and silently starve one of them.
++             */
++            if (message->param.supi) {
++                ogs_sbi_discovery_option_set_supi(
++                        discovery_option, message->param.supi);
++                discovery_option_presence = true;
++            }
+         } else if (!strcmp(ogs_hash_this_key(hi), OGS_SBI_PARAM_HOME_PLMN_ID)) {
+             char *v = NULL;
+             cJSON *item = NULL;
+@@ -1738,6 +1761,18 @@ static char *build_json(const ogs_sbi_message_t *message)
+         item = OpenAPI_sm_policy_context_data_convertToJSON(
+                 message->SmPolicyContextData);
+         ogs_assert(item);
++    } else if (message->ChargingDataRequest) {
++        item = OpenAPI_charging_data_request_convertToJSON(
++                message->ChargingDataRequest);
++        ogs_assert(item);
++    } else if (message->ChargingDataResponse) {
++        item = OpenAPI_charging_data_response_convertToJSON(
++                message->ChargingDataResponse);
++        ogs_assert(item);
++    } else if (message->ChargingNotifyRequest) {
++        item = OpenAPI_charging_notify_request_convertToJSON(
++                message->ChargingNotifyRequest);
++        ogs_assert(item);
+     } else if (message->SmPolicyDecision) {
+         item = OpenAPI_sm_policy_decision_convertToJSON(
+                 message->SmPolicyDecision);
+@@ -3143,6 +3178,32 @@ static int parse_json(ogs_sbi_message_t *message,
+             END
+             break;
+ 
++        case OpenAPI_service_name_nchf_convergedcharging:
++            /*
++             * TS 32.291 §6.3.  A request carries a ChargingDataRequest; a
++             * 2xx to Create or Update carries a ChargingDataResponse.
++             * Release answers 204 with no body, and an error carries
++             * ProblemDetails, which is handled above.
++             */
++            if (message->res_status == 0) {
++                message->ChargingDataRequest =
++                    OpenAPI_charging_data_request_parseFromJSON(item);
++                if (!message->ChargingDataRequest) {
++                    rv = OGS_ERROR;
++                    ogs_error("JSON parse error");
++                }
++            } else if (message->res_status < 300) {
++                message->ChargingDataResponse =
++                    OpenAPI_charging_data_response_parseFromJSON(item);
++                if (!message->ChargingDataResponse) {
++                    rv = OGS_ERROR;
++                    ogs_error("JSON parse error");
++                }
++            } else {
++                ogs_error("HTTP ERROR Status : %d", message->res_status);
++            }
++            break;
++
+         case OGS_SBI_SERVICE_NAME_ID_NSMF_CALLBACK:
+             SWITCH(message->h.resource.component[0])
+             CASE(OGS_SBI_RESOURCE_NAME_N1_N2_FAILURE_NOTIFY)
+@@ -3159,6 +3220,15 @@ static int parse_json(ogs_sbi_message_t *message,
+                 }
+                 break;
+ 
++            CASE(OGS_SBI_RESOURCE_NAME_CHARGING_NOTIFY)
++                message->ChargingNotifyRequest =
++                    OpenAPI_charging_notify_request_parseFromJSON(item);
++                if (!message->ChargingNotifyRequest) {
++                    rv = OGS_ERROR;
++                    ogs_error("JSON parse error");
++                }
++                break;
++
+             CASE(OGS_SBI_RESOURCE_NAME_SM_POLICY_NOTIFY)
+                 SWITCH(message->h.resource.component[2])
+                 CASE(OGS_SBI_RESOURCE_NAME_UPDATE)
+@@ -3795,6 +3865,9 @@ void ogs_sbi_discovery_option_free(
+     if (discovery_option->hnrf_uri)
+         ogs_free(discovery_option->hnrf_uri);
+ 
++    if (discovery_option->supi)
++        ogs_free(discovery_option->supi);
++
+     ogs_free(discovery_option);
+ }
+ 
+@@ -4413,3 +4486,15 @@ void ogs_sbi_discovery_option_clear_hnrf_uri(
+     ogs_free(discovery_option->hnrf_uri);
+     discovery_option->hnrf_uri = NULL;
+ }
++
++void ogs_sbi_discovery_option_set_supi(
++        ogs_sbi_discovery_option_t *discovery_option, const char *supi)
++{
++    ogs_assert(discovery_option);
++    ogs_assert(supi);
++
++    if (discovery_option->supi)
++        ogs_free(discovery_option->supi);
++    discovery_option->supi = ogs_strdup(supi);
++    ogs_assert(discovery_option->supi);
++}
+diff --git a/lib/sbi/message.h b/lib/sbi/message.h
+index d9f650fcd..91b142779 100644
+--- a/lib/sbi/message.h
++++ b/lib/sbi/message.h
+@@ -125,6 +125,11 @@ extern "C" {
+ 
+ #define OGS_SBI_RESOURCE_NAME_SM_POLICY_NOTIFY      "sm-policy-notify"
+ #define OGS_SBI_RESOURCE_NAME_N1_N2_FAILURE_NOTIFY  "n1-n2-failure-notify"
++/* Where the SMF serves TS 32.291 ChargingNotify, under its own
++ * nsmf-callback service.  It is the SMF that names this resource - the CHF
++ * only ever uses the notifyUri it was handed - but the name is shared, so
++ * it lives here rather than in src/smf. */
++#define OGS_SBI_RESOURCE_NAME_CHARGING_NOTIFY       "charging-notify"
+ 
+ #define OGS_SBI_RESOURCE_NAME_UE_CONTEXTS           "ue-contexts"
+ #define OGS_SBI_RESOURCE_NAME_N1_N2_MESSAGES        "n1-n2-messages"
+@@ -145,6 +150,9 @@ extern "C" {
+ #define OGS_SBI_RESOURCE_NAME_UPDATE                "update"
+ #define OGS_SBI_RESOURCE_NAME_TERMINATE             "terminate"
+ 
++/* TS 32.291 §6.1 — Nchf_ConvergedCharging resource path component */
++#define OGS_SBI_RESOURCE_NAME_CHARGINGDATA          "chargingdata"
++
+ #define OGS_SBI_RESOURCE_NAME_NETWORK_SLICE_INFORMATION \
+                                                     "network-slice-information"
+ 
+@@ -481,6 +489,8 @@ typedef struct ogs_sbi_discovery_option_s {
+     char *hnrf_uri;
+ 
+     uint64_t requester_features;
++
++    char *supi;     /* TS 29.510 §6.2.6.2.10 — supi query param for CHF discovery */
+ } ogs_sbi_discovery_option_t;
+ 
+ typedef struct ogs_sbi_message_s {
+@@ -599,6 +609,13 @@ typedef struct ogs_sbi_message_s {
+     OpenAPI_policy_update_t *PolicyUpdate;
+     OpenAPI_am_policy_data_t *AmPolicyData;
+     OpenAPI_sm_policy_context_data_t *SmPolicyContextData;
++
++    /* TS 32.291 Nchf_ConvergedCharging.  Generated from
++     * TS32291_Nchf_ConvergedCharging.yaml like every other service - see
++     * lib/sbi/support/.../generator.sh. */
++    OpenAPI_charging_data_request_t *ChargingDataRequest;
++    OpenAPI_charging_data_response_t *ChargingDataResponse;
++    OpenAPI_charging_notify_request_t *ChargingNotifyRequest;
+     OpenAPI_sm_policy_decision_t *SmPolicyDecision;
+     OpenAPI_sm_policy_data_t *SmPolicyData;
+     OpenAPI_sm_policy_delete_data_t *SmPolicyDeleteData;
+@@ -751,6 +768,9 @@ void ogs_sbi_discovery_option_set_hnrf_uri(
+ void ogs_sbi_discovery_option_clear_hnrf_uri(
+         ogs_sbi_discovery_option_t *discovery_option);
+ 
++void ogs_sbi_discovery_option_set_supi(
++        ogs_sbi_discovery_option_t *discovery_option, const char *supi);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/sbi/nnrf-build.c b/lib/sbi/nnrf-build.c
+index de3b8e8a2..b8734d427 100644
+--- a/lib/sbi/nnrf-build.c
++++ b/lib/sbi/nnrf-build.c
+@@ -26,10 +26,12 @@ static OpenAPI_smf_info_t *build_smf_info(ogs_sbi_nf_info_t *nf_info);
+ static OpenAPI_amf_info_t *build_amf_info(ogs_sbi_nf_info_t *nf_info);
+ static OpenAPI_scp_info_t *build_scp_info(ogs_sbi_nf_info_t *nf_info);
+ static OpenAPI_sepp_info_t *build_sepp_info(ogs_sbi_nf_info_t *nf_info);
++static OpenAPI_chf_info_t *build_chf_info(ogs_sbi_nf_info_t *nf_info);
+ static void free_smf_info(OpenAPI_smf_info_t *SmfInfo);
+ static void free_amf_info(OpenAPI_amf_info_t *AmfInfo);
+ static void free_scp_info(OpenAPI_scp_info_t *ScpInfo);
+ static void free_sepp_info(OpenAPI_sepp_info_t *SeppInfo);
++static void free_chf_info(OpenAPI_chf_info_t *ChfInfo);
+ 
+ ogs_sbi_request_t *ogs_nnrf_nfm_build_register(void)
+ {
+@@ -392,6 +394,10 @@ OpenAPI_nf_profile_t *ogs_nnrf_nfm_build_nf_profile(
+ 
+             /* SEPP info will be skipped here first and dealt with below. */
+ 
++        } else if (nf_info->nf_type == OpenAPI_nf_type_CHF) {
++
++            /* CHF info will be skipped here first and dealt with below. */
++
+         } else {
+             ogs_fatal("Not implemented NF-type[%s]",
+                     OpenAPI_nf_type_ToString(nf_info->nf_type));
+@@ -446,6 +452,15 @@ OpenAPI_nf_profile_t *ogs_nnrf_nfm_build_nf_profile(
+         ogs_assert(NFProfile->sepp_info);
+     }
+ 
++    /* There can only be one CHF info, not multiple.
++     * TS 29.510 §6.1.6.2.9 — ChfInfo (optional; only if SUPI ranges configured) */
++    nf_info = ogs_sbi_nf_info_find(
++            &nf_instance->nf_info_list, OpenAPI_nf_type_CHF);
++    if (nf_info) {
++        NFProfile->chf_info = build_chf_info(nf_info);
++        ogs_assert(NFProfile->chf_info);
++    }
++
+     return NFProfile;
+ }
+ 
+@@ -544,6 +559,9 @@ void ogs_nnrf_nfm_free_nf_profile(OpenAPI_nf_profile_t *NFProfile)
+     if (NFProfile->sepp_info)
+         free_sepp_info(NFProfile->sepp_info);
+ 
++    if (NFProfile->chf_info)
++        free_chf_info(NFProfile->chf_info);
++
+     ogs_free(NFProfile);
+ }
+ 
+@@ -1559,6 +1577,79 @@ static void free_sepp_info(OpenAPI_sepp_info_t *SeppInfo)
+     ogs_free(SeppInfo);
+ }
+ 
++/* TS 29.510 §6.1.6.2.9 — ChfInfo
++ * Build an OpenAPI ChfInfo from the internal ogs_sbi_chf_info_t.
++ * Only called when the CHF has SUPI ranges configured. */
++static OpenAPI_chf_info_t *build_chf_info(ogs_sbi_nf_info_t *nf_info)
++{
++    OpenAPI_chf_info_t *ChfInfo = NULL;
++    OpenAPI_list_t *SupiRangeList = NULL;
++    int i;
++
++    ogs_assert(nf_info);
++
++    ChfInfo = ogs_calloc(1, sizeof(*ChfInfo));
++    if (!ChfInfo) {
++        ogs_error("No ChfInfo");
++        return NULL;
++    }
++
++    SupiRangeList = OpenAPI_list_create();
++    if (!SupiRangeList) {
++        ogs_error("No SupiRangeList");
++        free_chf_info(ChfInfo);
++        return NULL;
++    }
++
++    for (i = 0; i < nf_info->chf.num_of_supi_range; i++) {
++        OpenAPI_supi_range_t *SupiRange = NULL;
++
++        SupiRange = ogs_calloc(1, sizeof(*SupiRange));
++        if (!SupiRange) {
++            ogs_error("No SupiRange[%d]", i);
++            break;
++        }
++
++        if (nf_info->chf.supi_range[i].start)
++            SupiRange->start = ogs_strdup(nf_info->chf.supi_range[i].start);
++        if (nf_info->chf.supi_range[i].end)
++            SupiRange->end = ogs_strdup(nf_info->chf.supi_range[i].end);
++        if (nf_info->chf.supi_range[i].pattern)
++            SupiRange->pattern =
++                ogs_strdup(nf_info->chf.supi_range[i].pattern);
++
++        OpenAPI_list_add(SupiRangeList, SupiRange);
++    }
++
++    if (SupiRangeList->count)
++        ChfInfo->supi_range_list = SupiRangeList;
++    else
++        OpenAPI_list_free(SupiRangeList);
++
++    return ChfInfo;
++}
++
++static void free_chf_info(OpenAPI_chf_info_t *ChfInfo)
++{
++    OpenAPI_supi_range_t *SupiRange = NULL;
++    OpenAPI_lnode_t *node = NULL;
++
++    ogs_assert(ChfInfo);
++
++    OpenAPI_list_for_each(ChfInfo->supi_range_list, node) {
++        SupiRange = node->data;
++        if (SupiRange) {
++            if (SupiRange->start)   ogs_free(SupiRange->start);
++            if (SupiRange->end)     ogs_free(SupiRange->end);
++            if (SupiRange->pattern) ogs_free(SupiRange->pattern);
++            ogs_free(SupiRange);
++        }
++    }
++    OpenAPI_list_free(ChfInfo->supi_range_list);
++
++    ogs_free(ChfInfo);
++}
++
+ ogs_sbi_request_t *ogs_nnrf_nfm_build_update(void)
+ {
+     ogs_sbi_nf_instance_t *nf_instance = NULL;
+diff --git a/lib/sbi/nnrf-handler.c b/lib/sbi/nnrf-handler.c
+index da1cf2104..478ace247 100644
+--- a/lib/sbi/nnrf-handler.c
++++ b/lib/sbi/nnrf-handler.c
+@@ -29,6 +29,8 @@ static bool handle_sepp_info(
+         ogs_sbi_nf_instance_t *nf_instance, OpenAPI_sepp_info_t *SeppInfo);
+ static bool handle_amf_info(
+         ogs_sbi_nf_instance_t *nf_instance, OpenAPI_amf_info_t *AmfInfo);
++static void handle_chf_info(
++        ogs_sbi_nf_instance_t *nf_instance, OpenAPI_chf_info_t *ChfInfo);
+ 
+ void ogs_nnrf_nfm_handle_nf_register(
+         ogs_sbi_nf_instance_t *nf_instance, ogs_sbi_message_t *recvmsg)
+@@ -340,6 +342,15 @@ bool ogs_nnrf_nfm_handle_nf_profile(
+             handle_sepp_info(nf_instance, NFProfile->sepp_info) == false)
+         return false;
+ 
++    /* TS 29.510 §6.1.6.2.9 — ChfInfo */
++    if (NFProfile->chf_info)
++        handle_chf_info(nf_instance, NFProfile->chf_info);
++    OpenAPI_list_for_each(NFProfile->chf_info_list, node) {
++        OpenAPI_map_t *ChfInfoMap = node->data;
++        if (ChfInfoMap && ChfInfoMap->value)
++            handle_chf_info(nf_instance, ChfInfoMap->value);
++    }
++
+     return true;
+ }
+ 
+@@ -1047,6 +1058,60 @@ static void handle_validity_time(
+     ogs_free(validity_time_string);
+ }
+ 
++/* TS 29.510 §6.1.6.2.9 — ChfInfo: populate ogs_sbi_chf_info_t from
++ * the OpenAPI ChfInfo object received in an NF profile. */
++static void handle_chf_info(
++        ogs_sbi_nf_instance_t *nf_instance, OpenAPI_chf_info_t *ChfInfo)
++{
++    ogs_sbi_nf_info_t *nf_info = NULL;
++    OpenAPI_lnode_t *node = NULL;
++    int i = 0;
++
++    ogs_assert(nf_instance);
++    if (!ChfInfo) return;
++
++    nf_info = ogs_sbi_nf_info_add(
++            &nf_instance->nf_info_list, OpenAPI_nf_type_CHF);
++    ogs_assert(nf_info);
++
++    /* supiRangeList: TS 29.510 §6.1.6.2.9 */
++    OpenAPI_list_for_each(ChfInfo->supi_range_list, node) {
++        OpenAPI_supi_range_t *range = node->data;
++        if (!range) continue;
++        if (i >= OGS_MAX_NUM_OF_SUPI_RANGE) {
++            ogs_warn("OVERFLOW supiRangeList [%d]", i);
++            break;
++        }
++        if (range->start)
++            nf_info->chf.supi_range[i].start = ogs_strdup(range->start);
++        if (range->end)
++            nf_info->chf.supi_range[i].end = ogs_strdup(range->end);
++        if (range->pattern)
++            nf_info->chf.supi_range[i].pattern = ogs_strdup(range->pattern);
++        i++;
++    }
++    nf_info->chf.num_of_supi_range = i;
++
++    /* gpsiRangeList (informational — not used for routing today) */
++    i = 0;
++    OpenAPI_list_for_each(ChfInfo->gpsi_range_list, node) {
++        OpenAPI_identity_range_t *range = node->data;
++        if (!range) continue;
++        if (i >= OGS_MAX_NUM_OF_SUPI_RANGE) {
++            ogs_warn("OVERFLOW gpsiRangeList [%d]", i);
++            break;
++        }
++        if (range->start)
++            nf_info->chf.gpsi_range[i].start = ogs_strdup(range->start);
++        if (range->end)
++            nf_info->chf.gpsi_range[i].end = ogs_strdup(range->end);
++        if (range->pattern)
++            nf_info->chf.gpsi_range[i].pattern = ogs_strdup(range->pattern);
++        i++;
++    }
++    nf_info->chf.num_of_gpsi_range = i;
++}
++
+ void ogs_nnrf_nfm_handle_nf_status_subscribe(
+         ogs_sbi_subscription_data_t *subscription_data,
+         ogs_sbi_message_t *recvmsg)
+diff --git a/lib/sbi/ogs-sbi.h b/lib/sbi/ogs-sbi.h
+index 8536420b3..4a6c36a3c 100644
+--- a/lib/sbi/ogs-sbi.h
++++ b/lib/sbi/ogs-sbi.h
+@@ -77,6 +77,10 @@
+ #include "model/policy_association.h"
+ #include "model/am_policy_data.h"
+ #include "model/sm_policy_context_data.h"
++/* TS 32.291 Nchf_ConvergedCharging */
++#include "model/charging_data_request.h"
++#include "model/charging_data_response.h"
++#include "model/charging_notify_request.h"
+ #include "model/sm_policy_decision.h"
+ #include "model/sm_policy_data.h"
+ #include "model/sm_policy_delete_data.h"
+diff --git a/lib/sbi/types.h b/lib/sbi/types.h
+index 73ff7b668..9b0e2730d 100644
+--- a/lib/sbi/types.h
++++ b/lib/sbi/types.h
+@@ -37,6 +37,15 @@ extern "C" {
+ #define OGS_SBI_SERVICE_NAME_NSMF_CALLBACK "nsmf-callback"
+ #define OGS_SBI_SERVICE_NAME_NAMF_OAM "namf-oam"
+ 
++/*
++ * TS 32.291 — Nchf_ConvergedCharging.  The service name is present in
++ * OpenAPI_service_name_e as OpenAPI_service_name_nchf_convergedcharging;
++ * this string alias is retained for the CHF paths that build/parse the
++ * service name directly.  The TS 32.291 bodies are generated models,
++ * like every other service - see lib/sbi/support/.../generator.sh.
++ */
++#define OGS_SBI_SERVICE_NAME_NCHF_CONVERGEDCHARGING "nchf-convergedcharging"
++
+ #define OGS_SBI_MAX_NUM_OF_SERVICE_NAME 128
+ 
+ /*

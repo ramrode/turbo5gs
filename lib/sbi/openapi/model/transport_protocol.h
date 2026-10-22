@@ -1,7 +1,7 @@
 /*
  * transport_protocol.h
  *
- * Types of transport protocol used in a given IP endpoint of an NF Service Instance
+ * 
  */
 
 #ifndef _OpenAPI_transport_protocol_H_
@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-typedef enum { OpenAPI_transport_protocol_NULL = 0, OpenAPI_transport_protocol_TCP } OpenAPI_transport_protocol_e;
+typedef enum { OpenAPI_transport_protocol_NULL = 0, OpenAPI_transport_protocol_UDP, OpenAPI_transport_protocol_TCP } OpenAPI_transport_protocol_e;
 
 char* OpenAPI_transport_protocol_ToString(OpenAPI_transport_protocol_e transport_protocol);
 

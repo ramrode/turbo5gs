@@ -5,15 +5,17 @@
 #include "pdu_session_info.h"
 
 OpenAPI_pdu_session_info_t *OpenAPI_pdu_session_info_create(
-    OpenAPI_snssai_t *snssai,
-    char *dnn
+    OpenAPI_pdu_session_type_e pdu_sess_type,
+    OpenAPI_ssc_mode_e ssc_mode,
+    OpenAPI_list_t *access_types
 )
 {
     OpenAPI_pdu_session_info_t *pdu_session_info_local_var = ogs_malloc(sizeof(OpenAPI_pdu_session_info_t));
     ogs_assert(pdu_session_info_local_var);
 
-    pdu_session_info_local_var->snssai = snssai;
-    pdu_session_info_local_var->dnn = dnn;
+    pdu_session_info_local_var->pdu_sess_type = pdu_sess_type;
+    pdu_session_info_local_var->ssc_mode = ssc_mode;
+    pdu_session_info_local_var->access_types = access_types;
 
     return pdu_session_info_local_var;
 }
@@ -25,13 +27,9 @@ void OpenAPI_pdu_session_info_free(OpenAPI_pdu_session_info_t *pdu_session_info)
     if (NULL == pdu_session_info) {
         return;
     }
-    if (pdu_session_info->snssai) {
-        OpenAPI_snssai_free(pdu_session_info->snssai);
-        pdu_session_info->snssai = NULL;
-    }
-    if (pdu_session_info->dnn) {
-        ogs_free(pdu_session_info->dnn);
-        pdu_session_info->dnn = NULL;
+    if (pdu_session_info->access_types) {
+        OpenAPI_list_free(pdu_session_info->access_types);
+        pdu_session_info->access_types = NULL;
     }
     ogs_free(pdu_session_info);
 }
@@ -47,28 +45,32 @@ cJSON *OpenAPI_pdu_session_info_convertToJSON(OpenAPI_pdu_session_info_t *pdu_se
     }
 
     item = cJSON_CreateObject();
-    if (!pdu_session_info->snssai) {
-        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [snssai]");
-        return NULL;
-    }
-    cJSON *snssai_local_JSON = OpenAPI_snssai_convertToJSON(pdu_session_info->snssai);
-    if (snssai_local_JSON == NULL) {
-        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [snssai]");
+    if (pdu_session_info->pdu_sess_type != OpenAPI_pdu_session_type_NULL) {
+    if (cJSON_AddStringToObject(item, "pduSessType", OpenAPI_pdu_session_type_ToString(pdu_session_info->pdu_sess_type)) == NULL) {
+        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [pdu_sess_type]");
         goto end;
     }
-    cJSON_AddItemToObject(item, "snssai", snssai_local_JSON);
-    if (item->child == NULL) {
-        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [snssai]");
-        goto end;
     }
 
-    if (!pdu_session_info->dnn) {
-        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [dnn]");
-        return NULL;
-    }
-    if (cJSON_AddStringToObject(item, "dnn", pdu_session_info->dnn) == NULL) {
-        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [dnn]");
+    if (pdu_session_info->ssc_mode != OpenAPI_ssc_mode_NULL) {
+    if (cJSON_AddStringToObject(item, "sscMode", OpenAPI_ssc_mode_ToString(pdu_session_info->ssc_mode)) == NULL) {
+        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [ssc_mode]");
         goto end;
+    }
+    }
+
+    if (pdu_session_info->access_types != OpenAPI_access_type_NULL) {
+    cJSON *access_typesList = cJSON_AddArrayToObject(item, "accessTypes");
+    if (access_typesList == NULL) {
+        ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [access_types]");
+        goto end;
+    }
+    OpenAPI_list_for_each(pdu_session_info->access_types, node) {
+        if (cJSON_AddStringToObject(access_typesList, "", OpenAPI_access_type_ToString((intptr_t)node->data)) == NULL) {
+            ogs_error("OpenAPI_pdu_session_info_convertToJSON() failed [access_types]");
+            goto end;
+        }
+    }
     }
 
 end:
@@ -79,40 +81,71 @@ OpenAPI_pdu_session_info_t *OpenAPI_pdu_session_info_parseFromJSON(cJSON *pdu_se
 {
     OpenAPI_pdu_session_info_t *pdu_session_info_local_var = NULL;
     OpenAPI_lnode_t *node = NULL;
-    cJSON *snssai = NULL;
-    OpenAPI_snssai_t *snssai_local_nonprim = NULL;
-    cJSON *dnn = NULL;
-    snssai = cJSON_GetObjectItemCaseSensitive(pdu_session_infoJSON, "snssai");
-    if (!snssai) {
-        ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [snssai]");
+    cJSON *pdu_sess_type = NULL;
+    OpenAPI_pdu_session_type_e pdu_sess_typeVariable = 0;
+    cJSON *ssc_mode = NULL;
+    OpenAPI_ssc_mode_e ssc_modeVariable = 0;
+    cJSON *access_types = NULL;
+    OpenAPI_list_t *access_typesList = NULL;
+    pdu_sess_type = cJSON_GetObjectItemCaseSensitive(pdu_session_infoJSON, "pduSessType");
+    if (pdu_sess_type) {
+    if (!cJSON_IsString(pdu_sess_type)) {
+        ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [pdu_sess_type]");
         goto end;
     }
-    snssai_local_nonprim = OpenAPI_snssai_parseFromJSON(snssai);
-    if (!snssai_local_nonprim) {
-        ogs_error("OpenAPI_snssai_parseFromJSON failed [snssai]");
-        goto end;
+    pdu_sess_typeVariable = OpenAPI_pdu_session_type_FromString(pdu_sess_type->valuestring);
     }
 
-    dnn = cJSON_GetObjectItemCaseSensitive(pdu_session_infoJSON, "dnn");
-    if (!dnn) {
-        ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [dnn]");
+    ssc_mode = cJSON_GetObjectItemCaseSensitive(pdu_session_infoJSON, "sscMode");
+    if (ssc_mode) {
+    if (!cJSON_IsString(ssc_mode)) {
+        ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [ssc_mode]");
         goto end;
     }
-    if (!cJSON_IsString(dnn)) {
-        ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [dnn]");
-        goto end;
+    ssc_modeVariable = OpenAPI_ssc_mode_FromString(ssc_mode->valuestring);
+    }
+
+    access_types = cJSON_GetObjectItemCaseSensitive(pdu_session_infoJSON, "accessTypes");
+    if (access_types) {
+        cJSON *access_types_local = NULL;
+        if (!cJSON_IsArray(access_types)) {
+            ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [access_types]");
+            goto end;
+        }
+
+        access_typesList = OpenAPI_list_create();
+
+        cJSON_ArrayForEach(access_types_local, access_types) {
+            OpenAPI_access_type_e localEnum = OpenAPI_access_type_NULL;
+            if (!cJSON_IsString(access_types_local)) {
+                ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed [access_types]");
+                goto end;
+            }
+            localEnum = OpenAPI_access_type_FromString(access_types_local->valuestring);
+            if (!localEnum) {
+                ogs_info("Enum value \"%s\" for field \"access_types\" is not supported. Ignoring it ...",
+                         access_types_local->valuestring);
+            } else {
+                OpenAPI_list_add(access_typesList, (void *)localEnum);
+            }
+        }
+        if (access_typesList->count == 0) {
+            ogs_error("OpenAPI_pdu_session_info_parseFromJSON() failed: Expected access_typesList to not be empty (after ignoring unsupported enum values).");
+            goto end;
+        }
     }
 
     pdu_session_info_local_var = OpenAPI_pdu_session_info_create (
-        snssai_local_nonprim,
-        ogs_strdup(dnn->valuestring)
+        pdu_sess_type ? pdu_sess_typeVariable : 0,
+        ssc_mode ? ssc_modeVariable : 0,
+        access_types ? access_typesList : NULL
     );
 
     return pdu_session_info_local_var;
 end:
-    if (snssai_local_nonprim) {
-        OpenAPI_snssai_free(snssai_local_nonprim);
-        snssai_local_nonprim = NULL;
+    if (access_typesList) {
+        OpenAPI_list_free(access_typesList);
+        access_typesList = NULL;
     }
     return NULL;
 }

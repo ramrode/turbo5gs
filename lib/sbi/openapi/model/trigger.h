@@ -28,7 +28,7 @@ struct OpenAPI_trigger_s {
     bool is_volume_limit;
     int volume_limit;
     bool is_volume_limit64;
-    int volume_limit64;
+    long volume_limit64;
     bool is_event_limit;
     int event_limit;
     bool is_max_number_ofccc;
@@ -44,7 +44,7 @@ OpenAPI_trigger_t *OpenAPI_trigger_create(
     bool is_volume_limit,
     int volume_limit,
     bool is_volume_limit64,
-    int volume_limit64,
+    long volume_limit64,
     bool is_event_limit,
     int event_limit,
     bool is_max_number_ofccc,

@@ -14,7 +14,7 @@
 #include "../include/binary.h"
 typedef struct OpenAPI_geographic_area_s OpenAPI_geographic_area_t;
 #include "ellipsoid_arc.h"
-#include "geographical_coordinates.h"
+#include "geographical_coordinates_1.h"
 #include "point.h"
 #include "point_altitude.h"
 #include "point_altitude_uncertainty.h"
@@ -30,7 +30,7 @@ extern "C" {
 
 struct OpenAPI_geographic_area_s {
     OpenAPI_supported_gad_shapes_e shape;
-    struct OpenAPI_geographical_coordinates_s *point;
+    struct OpenAPI_geographical_coordinates_1_s *point;
     float uncertainty;
     struct OpenAPI_uncertainty_ellipse_s *uncertainty_ellipse;
     int confidence;
@@ -47,7 +47,7 @@ struct OpenAPI_geographic_area_s {
 
 OpenAPI_geographic_area_t *OpenAPI_geographic_area_create(
     OpenAPI_supported_gad_shapes_e shape,
-    OpenAPI_geographical_coordinates_t *point,
+    OpenAPI_geographical_coordinates_1_t *point,
     float uncertainty,
     OpenAPI_uncertainty_ellipse_t *uncertainty_ellipse,
     int confidence,

@@ -1,7 +1,7 @@
 /*
  * tai_1.h
  *
- * Contains the tracking area identity as described in 3GPP 23.003
+ * 
  */
 
 #ifndef _OpenAPI_tai_1_H_
@@ -13,22 +13,21 @@
 #include "../include/keyValuePair.h"
 #include "../include/binary.h"
 typedef struct OpenAPI_tai_1_s OpenAPI_tai_1_t;
-#include "plmn_id.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct OpenAPI_tai_1_s {
-    struct OpenAPI_plmn_id_s *plmn_id;
+    char *mcc;
+    char *mnc;
     char *tac;
-    char *nid;
 };
 
 OpenAPI_tai_1_t *OpenAPI_tai_1_create(
-    OpenAPI_plmn_id_t *plmn_id,
-    char *tac,
-    char *nid
+    char *mcc,
+    char *mnc,
+    char *tac
 );
 void OpenAPI_tai_1_free(OpenAPI_tai_1_t *tai_1);
 OpenAPI_tai_1_t *OpenAPI_tai_1_parseFromJSON(cJSON *tai_1JSON);

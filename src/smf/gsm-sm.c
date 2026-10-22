@@ -28,6 +28,8 @@
 #include "nsmf-handler.h"
 #include "nudm-handler.h"
 #include "npcf-handler.h"
+#include "nchf-build.h"
+#include "nchf-handler.h"
 #include "namf-handler.h"
 #include "gsm-handler.h"
 #include "ngap-handler.h"
@@ -258,6 +260,43 @@ static void hsmf_update_send_bad_request(
             sbi_message, strerror, NULL, NULL));
 
     ogs_free(strerror);
+}
+
+/*
+ * Tear a session down because online charging said the quota is gone
+ * (CHF FinalUnitIndication, or a PFCP report that arrives after one).
+ *
+ * The PFCP deletion goes first, as in the UE-requested release: its response
+ * carries the UPF's final Usage Report, which the CHF Release then bills.
+ * For a 5GC session the flag tells the deletion-response handler to follow
+ * it with a PDU Session Release Command over N1/N2 (TS 23.502 §4.3.4.2), so
+ * the UE learns the session is gone.  Without that the UE keeps its PDU
+ * session and its interface up, its traffic is silently dropped, and the gNB
+ * answers the stale tunnel with GTP-U Error Indications until it gives up.
+ *
+ * EPC has no N1/N2 and is unaffected.
+ */
+static void release_after_final_unit(ogs_fsm_t *s, smf_event_t *e,
+        smf_sess_t *sess)
+{
+    smf_ue_t *smf_ue = NULL;
+
+    ogs_assert(s);
+    ogs_assert(e);
+    ogs_assert(sess);
+
+    smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
+    ogs_assert(smf_ue);
+
+    if (!sess->epc) {
+        ogs_info("[%s:%d] Quota exhausted — releasing the PDU session",
+                smf_ue->supi, sess->psi);
+        sess->sm_data.fui_release_triggered = true;
+    }
+
+    e->h.sbi.data = NULL;
+    e->h.sbi.state = OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED;
+    OGS_FSM_TRAN(s, smf_gsm_state_wait_pfcp_deletion);
 }
 
 void smf_gsm_state_initial(ogs_fsm_t *s, smf_event_t *e)
@@ -713,6 +752,7 @@ test_can_proceed:
 
 void smf_gsm_state_wait_5gc_sm_policy_association(ogs_fsm_t *s, smf_event_t *e)
 {
+    int r;
     char *strerror = NULL;
     smf_ue_t *smf_ue = NULL;
     smf_sess_t *sess = NULL;
@@ -872,8 +912,50 @@ void smf_gsm_state_wait_5gc_sm_policy_association(ogs_fsm_t *s, smf_event_t *e)
                     OGS_FSM_TRAN(s, smf_gsm_state_5gc_n1_n2_reject);
                 } else if (smf_npcf_smpolicycontrol_handle_create(
                         sess, stream, sbi_message) == true) {
-                    OGS_FSM_TRAN(s,
-                        &smf_gsm_state_wait_pfcp_establishment);
+                    /* TS 29.513 §5.2.1 — online charging after policy */
+                    if (smf_select_online_charging(sess) ==
+                            SMF_OC_IFACE_CHF) {
+                        ogs_sbi_discovery_option_t *option;
+                        smf_ue_t *chf_ue =
+                                smf_ue_find_by_id(sess->smf_ue_id);
+                        ogs_assert(chf_ue);
+                        option = ogs_sbi_discovery_option_new();
+                        ogs_assert(option);
+                        ogs_sbi_discovery_option_set_supi(
+                                option, chf_ue->supi);
+                        /*
+                         * Ask for a CHF that serves this session's slice as
+                         * well as this subscriber.  A CHF that registered
+                         * allowedNssais is only discovered for the slices it
+                         * listed (TS 33.518 §4.2.2.2.1); one that registered
+                         * none stays eligible for every slice, so adding this
+                         * changes nothing for a single-CHF deployment.
+                         *
+                         * The two filters AND: a deployment that wants one
+                         * CHF per slice and another for a SUPI range
+                         * regardless of slice must leave the latter's
+                         * charging.slices empty.
+                         */
+                        ogs_sbi_discovery_option_add_snssais(
+                                option, &sess->s_nssai);
+                        sess->sm_data.nchf_create_in_flight = true;
+                        r = smf_sbi_discover_and_send(
+                                OpenAPI_service_name_nchf_convergedcharging,
+                                option,
+                                smf_nchf_convergedcharging_build_create,
+                                sess, stream, 0, NULL);
+                        ogs_expect(r == OGS_OK);
+                        ogs_assert(r != OGS_ERROR);
+                        OGS_FSM_TRAN(s,
+                                &smf_gsm_state_wait_5gc_nchf_create);
+                    } else {
+                        /* No online charging — send PFCP now and wait. */
+                        ogs_assert(OGS_OK ==
+                            smf_5gc_pfcp_send_session_establishment_request(
+                                sess, stream, 0));
+                        OGS_FSM_TRAN(s,
+                                &smf_gsm_state_wait_pfcp_establishment);
+                    }
                 } else {
                     ogs_error(
                         "smf_npcf_smpolicycontrol_handle_create() failed");
@@ -898,6 +980,90 @@ void smf_gsm_state_wait_5gc_sm_policy_association(ogs_fsm_t *s, smf_event_t *e)
 
     default:
         ogs_error("No handler for event %s", smf_event_get_name(e));
+        break;
+    }
+}
+
+/* ------------------------------------------------------------------
+ * Phase 5 — Wait for Nchf_ConvergedCharging Create response
+ *
+ * TS 29.513 §5.2.1 step 3a: SMF sends ChargingDataRequest (Initial)
+ * to CHF after policy association succeeds. This state waits for the
+ * CHF 201 Created before proceeding to PFCP session establishment.
+ * ------------------------------------------------------------------ */
+void smf_gsm_state_wait_5gc_nchf_create(ogs_fsm_t *s, smf_event_t *e)
+{
+    smf_ue_t *smf_ue = NULL;
+    smf_sess_t *sess = NULL;
+    ogs_sbi_message_t *sbi_message = NULL;
+    ogs_sbi_stream_t *stream = NULL;
+    int service_name_id = OpenAPI_service_name_NULL;
+
+    ogs_assert(s);
+    ogs_assert(e);
+
+    smf_sm_debug(e);
+
+    sess = smf_sess_find_by_id(e->sess_id);
+    ogs_assert(sess);
+
+    switch (e->h.id) {
+    case OGS_FSM_ENTRY_SIG:
+    case OGS_FSM_EXIT_SIG:
+        break;
+
+    case OGS_EVENT_SBI_CLIENT:
+        sbi_message = e->h.sbi.message;
+        ogs_assert(sbi_message);
+
+        smf_ue = smf_ue_find_by_id(sess->smf_ue_id);
+        ogs_assert(smf_ue);
+
+        stream = ogs_sbi_stream_find_by_id(
+                    OGS_POINTER_TO_UINT(e->h.sbi.data));
+
+        service_name_id = ogs_sbi_service_name_id_from_string(
+                sbi_message->h.service.name);
+        switch (service_name_id) {
+        case OpenAPI_service_name_nchf_convergedcharging:
+            sess->sm_data.nchf_create_in_flight = false;
+
+            if (!smf_nchf_convergedcharging_handle_create(
+                        sess, sbi_message)) {
+                if (sess->sm_data.establishment_reject_cause)
+                    ogs_info("[%s:%d] PDU session refused by charging "
+                             "[5GSM cause:%d]", smf_ue->supi, sess->psi,
+                             sess->sm_data.establishment_reject_cause);
+                else
+                    ogs_error("[%s:%d] Nchf-Create failed [status:%d]",
+                            smf_ue->supi, sess->psi,
+                            sbi_message->res_status);
+                OGS_FSM_TRAN(s, smf_gsm_state_5gc_n1_n2_reject);
+                break;
+            }
+
+            /*
+             * Send PFCP Session Establishment only now, not from
+             * smf_npcf_smpolicycontrol_handle_create(): a co-located UPF
+             * answers faster than the CHF, so the N4 response would land in
+             * this state, which has no N4 handler, and be dropped — leaving
+             * the session stuck in wait_pfcp_establishment forever.
+             */
+            ogs_assert(OGS_OK ==
+                smf_5gc_pfcp_send_session_establishment_request(
+                    sess, stream, 0));
+            OGS_FSM_TRAN(s, &smf_gsm_state_wait_pfcp_establishment);
+            break;
+
+        default:
+            ogs_error("[%s:%d] Invalid API name [%s]",
+                    smf_ue->supi, sess->psi, sbi_message->h.service.name);
+            OGS_FSM_TRAN(s, smf_gsm_state_5gc_n1_n2_reject);
+        }
+        break;
+
+    default:
+        ogs_error("[%d] Unknown event %s", sess->psi, smf_event_get_name(e));
         break;
     }
 }
@@ -1204,10 +1370,8 @@ void smf_gsm_state_operational(ogs_fsm_t *s, smf_event_t *e)
         case OGS_PFCP_SESSION_REPORT_REQUEST_TYPE:
             release = smf_n4_handle_session_report_request(sess, pfcp_xact,
                             &pfcp_message->pfcp_session_report_request);
-            if (release) {
-                e->h.sbi.state = OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED;
-                OGS_FSM_TRAN(s, smf_gsm_state_wait_pfcp_deletion);
-            }
+            if (release)
+                release_after_final_unit(s, e, sess);
             break;
 
         default:
@@ -2037,6 +2201,28 @@ void smf_gsm_state_operational(ogs_fsm_t *s, smf_event_t *e)
             END
             break;
 
+        case OpenAPI_service_name_nchf_convergedcharging:
+            /* TS 32.291 §6.3.2 — CHF Update response while session is
+             * operational. handle_update() parses the refreshed grant,
+             * updates the bearer URR, and sends a PFCP Session Modification
+             * to push the new quota/threshold/validity to the UPF. */
+            smf_nchf_convergedcharging_handle_update(sess, sbi_message);
+
+            /* TS 32.291 §6.3.2.2 / TS 23.503 §6.3.2: on
+             * FinalUnitIndication=TERMINATE the session must be torn down
+             * now.  Waiting for another PFCP Usage Report is not an option:
+             * the UPF has just exhausted the quota and will not report again
+             * unless new traffic arrives.
+             *
+             * release_after_final_unit() queues SMF_EVT_SESSION_RELEASE
+             * rather than transitioning from here.  This Update was
+             * fire-and-forget, so e->h.sbi.{data,state} still hold the CHF
+             * transaction's values, which the release states would misread
+             * as a stream id and a PFCP delete trigger. */
+            if (sess->chf.final_unit)
+                release_after_final_unit(s, e, sess);
+            break;
+
         default:
             ogs_error("[%s:%d] Invalid API name [%s]",
                     smf_ue->supi, sess->psi, sbi_message->h.service.name);
@@ -2456,6 +2642,11 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
             ogs_assert(OGS_OK ==
                 smf_5gc_pfcp_send_session_deletion_request(
                     sess, stream, e->h.sbi.state));
+            /* The CHF Release is NOT sent here: it must carry the UPF's
+             * final usage, which only arrives in the deletion response.
+             * See OGS_PFCP_SESSION_DELETION_RESPONSE_TYPE below, and
+             * SMF_TIMER_PFCP_NO_DELETION_RESPONSE when the UPF never
+             * answers. */
         }
         break;
 
@@ -2523,6 +2714,16 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
                 status = smf_5gc_n4_handle_session_deletion_response(
                             sess, stream, trigger,
                             &pfcp_message->pfcp_session_deletion_response);
+
+                /*
+                 * TS 32.291 §6.3.3 — final charging.  The handler above has
+                 * just folded the UPF's last Usage Report into the session
+                 * counters, so the Release now bills the session through to
+                 * its end.  Sent before the status check: a rejected
+                 * deletion still ends the charging session.
+                 */
+                smf_nchf_send_release(sess);
+
                 if (status != OGS_SBI_HTTP_STATUS_OK) {
                     ogs_error(
                         "[%d] smf_5gc_n4_handle_session_deletion_response() "
@@ -2532,7 +2733,50 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
                     break;
                 }
 
-                if (trigger == OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED) {
+                if (trigger == OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED &&
+                    sess->sm_data.fui_release_triggered &&
+                    !HOME_ROUTED_ROAMING_IN_HSMF(sess) &&
+                    !HOME_ROUTED_ROAMING_IN_VSMF(sess)) {
+                    smf_n1_n2_message_transfer_param_t param;
+
+                    /*
+                     * Quota exhausted: the UPF session is gone and the final
+                     * usage is billed, so tell the UE and the gNB before
+                     * releasing the rest.  TS 23.502 §4.3.4.2, the same
+                     * N1/N2 exchange the UE-requested release uses below.
+                     *
+                     * The 5GSM cause is "insufficient resources" rather than
+                     * "reactivation requested": the subscriber has nothing
+                     * left this cycle, so inviting the UE to re-establish
+                     * immediately would only produce a session that is
+                     * refused again.
+                     *
+                     * Home-routed roaming is excluded: there the UE-facing
+                     * N1/N2 belongs to the V-SMF, and the H-SMF releases
+                     * through the V-SMF instead.
+                     */
+                    memset(&param, 0, sizeof(param));
+                    param.state =
+                        SMF_UE_OR_NETWORK_REQUESTED_PDU_SESSION_RELEASE;
+                    sess->pti = OGS_NAS_PROCEDURE_TRANSACTION_IDENTITY_UNASSIGNED;
+
+                    param.n1smbuf = gsm_build_pdu_session_release_command(
+                            sess, OGS_5GSM_CAUSE_INSUFFICIENT_RESOURCES);
+                    ogs_assert(param.n1smbuf);
+
+                    param.n2smbuf =
+                        ngap_build_pdu_session_resource_release_command_transfer(
+                            sess, SMF_NGAP_STATE_DELETE_TRIGGER_SMF_INITIATED,
+                            NGAP_Cause_PR_nas, NGAP_CauseNas_normal_release);
+                    ogs_assert(param.n2smbuf);
+
+                    smf_namf_comm_send_n1_n2_message_transfer(
+                            sess, NULL, &param);
+
+                    OGS_FSM_TRAN(s, smf_gsm_state_wait_5gc_n1_n2_release);
+
+                } else if (trigger ==
+                        OGS_PFCP_DELETE_TRIGGER_LOCAL_INITIATED) {
 
                     /*
                      * There is no peer waiting for a response, so the
@@ -3002,6 +3246,21 @@ void smf_gsm_state_wait_pfcp_deletion(ogs_fsm_t *s, smf_event_t *e)
                     ogs_assert_if_reached();
                 }
             }
+            break;
+
+        case OGS_PFCP_SESSION_REPORT_REQUEST_TYPE:
+            /*
+             * The UPF sent a Session Report Request before it processed our
+             * deletion.  Previously this fell to the default below: no
+             * response was sent, so the UPF retransmitted it until it gave
+             * up ("No Reponse. Give up!"), and the usage it carried was never
+             * billed - the UPF had already advanced its reporting baseline
+             * when it sent the report.  Bank the usage and respond; the final
+             * Release / CCR-T goes out after the deletion response and now
+             * includes it.
+             */
+            smf_n4_handle_session_report_request_in_deletion(
+                    sess, pfcp_xact, &pfcp_message->pfcp_session_report_request);
             break;
 
         default:
@@ -4061,6 +4320,15 @@ void smf_gsm_state_5gc_n1_n2_reject(ogs_fsm_t *s, smf_event_t *e)
 
     switch (e->h.id) {
     case OGS_FSM_ENTRY_SIG:
+        /*
+         * The session is refused, but the CHF may already have opened a
+         * charging session for it (the Create is answered before the reject
+         * is decided).  Close it, so the CHF does not keep the session and
+         * its chf.sessions row.  No-op when there is no association.
+         */
+        if (!sess->epc)
+            smf_nchf_send_release(sess);
+
         if (PCF_SM_POLICY_ASSOCIATED(sess)) {
             int r = 0;
 
@@ -4429,6 +4697,24 @@ void smf_gsm_state_exception(ogs_fsm_t *s, smf_event_t *e)
     switch (e->h.id) {
     case OGS_FSM_ENTRY_SIG:
         ogs_error("[%s:%d] State machine exception", smf_ue->supi, sess->psi);
+
+        /*
+         * Gap 1/2 fix: send a fire-and-forget CHF Release before freeing
+         * the session to prevent MongoDB orphan records in chf.sessions.
+         *
+         * This state is reached from smf_gsm_state_operational and
+         * smf_gsm_state_wait_5gc_n1_n2_release on protocol errors (invalid
+         * SBI resource name, NGAP parse failure, etc.) where the normal
+         * teardown path through smf_gsm_state_wait_pfcp_deletion is bypassed.
+         *
+         * The Release is truly fire-and-forget: SMF_SESS_CLEAR() frees the
+         * session immediately after.  When the response arrives later,
+         * smf_sess_find_by_id() returns NULL and smf-sm.c logs a warning
+         * and discards the response — no crash, no double-free.
+         */
+        if (!sess->epc)
+            smf_nchf_send_release(sess);
+
         SMF_SESS_CLEAR(sess);
         break;
 

@@ -8,6 +8,8 @@ import SubscriberIcon from 'react-icons/lib/md/person-add';
 import ProfileIcon from 'react-icons/lib/md/content-copy';
 import AccountIcon from 'react-icons/lib/md/vpn-key';
 import EirIcon from 'react-icons/lib/md/phonelink-lock';
+import ChfQuotaIcon from 'react-icons/lib/md/data-usage';
+import ChfSessionIcon from 'react-icons/lib/md/wifi-tethering';
 
 const Menu = styled.div`
   display: block;
@@ -97,6 +99,14 @@ const Sidebar = ({ isOpen, width, selectedView, onSelectView }) => (
     <Item name="account" selected={selectedView} onSelect={onSelectView}>
       <Icon><AccountIcon/></Icon>
       <Title>Account</Title>
+    </Item>
+    <Item name="chfsubscriber" selected={selectedView} onSelect={onSelectView}>
+      <Icon><ChfQuotaIcon/></Icon>
+      <Title>CHF Quota</Title>
+    </Item>
+    <Item name="chfsession" selected={selectedView} onSelect={onSelectView}>
+      <Icon><ChfSessionIcon/></Icon>
+      <Title>CHF Sessions</Title>
     </Item>
   </Menu>
 )

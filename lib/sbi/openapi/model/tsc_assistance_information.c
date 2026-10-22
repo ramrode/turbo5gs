@@ -5,17 +5,17 @@
 #include "tsc_assistance_information.h"
 
 OpenAPI_tsc_assistance_information_t *OpenAPI_tsc_assistance_information_create(
+    OpenAPI_tsc_flow_direction_e flow_direction,
     bool is_periodicity,
-    int periodicity,
-    OpenAPI_n6_jitter_information_t *n6_jitter_information
+    int periodicity
 )
 {
     OpenAPI_tsc_assistance_information_t *tsc_assistance_information_local_var = ogs_malloc(sizeof(OpenAPI_tsc_assistance_information_t));
     ogs_assert(tsc_assistance_information_local_var);
 
+    tsc_assistance_information_local_var->flow_direction = flow_direction;
     tsc_assistance_information_local_var->is_periodicity = is_periodicity;
     tsc_assistance_information_local_var->periodicity = periodicity;
-    tsc_assistance_information_local_var->n6_jitter_information = n6_jitter_information;
 
     return tsc_assistance_information_local_var;
 }
@@ -27,10 +27,6 @@ void OpenAPI_tsc_assistance_information_free(OpenAPI_tsc_assistance_information_
     if (NULL == tsc_assistance_information) {
         return;
     }
-    if (tsc_assistance_information->n6_jitter_information) {
-        OpenAPI_n6_jitter_information_free(tsc_assistance_information->n6_jitter_information);
-        tsc_assistance_information->n6_jitter_information = NULL;
-    }
     ogs_free(tsc_assistance_information);
 }
 
@@ -40,27 +36,21 @@ cJSON *OpenAPI_tsc_assistance_information_convertToJSON(OpenAPI_tsc_assistance_i
     OpenAPI_lnode_t *node = NULL;
 
     if (tsc_assistance_information == NULL) {
-        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [TscAssistanceInformation]");
+        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [TSCAssistanceInformation]");
         return NULL;
     }
 
     item = cJSON_CreateObject();
-    if (tsc_assistance_information->is_periodicity) {
-    if (cJSON_AddNumberToObject(item, "periodicity", tsc_assistance_information->periodicity) == NULL) {
-        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [periodicity]");
+    if (tsc_assistance_information->flow_direction != OpenAPI_tsc_flow_direction_NULL) {
+    if (cJSON_AddStringToObject(item, "flowDirection", OpenAPI_tsc_flow_direction_ToString(tsc_assistance_information->flow_direction)) == NULL) {
+        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [flow_direction]");
         goto end;
     }
     }
 
-    if (tsc_assistance_information->n6_jitter_information) {
-    cJSON *n6_jitter_information_local_JSON = OpenAPI_n6_jitter_information_convertToJSON(tsc_assistance_information->n6_jitter_information);
-    if (n6_jitter_information_local_JSON == NULL) {
-        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [n6_jitter_information]");
-        goto end;
-    }
-    cJSON_AddItemToObject(item, "n6JitterInformation", n6_jitter_information_local_JSON);
-    if (item->child == NULL) {
-        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [n6_jitter_information]");
+    if (tsc_assistance_information->is_periodicity) {
+    if (cJSON_AddNumberToObject(item, "periodicity", tsc_assistance_information->periodicity) == NULL) {
+        ogs_error("OpenAPI_tsc_assistance_information_convertToJSON() failed [periodicity]");
         goto end;
     }
     }
@@ -73,9 +63,18 @@ OpenAPI_tsc_assistance_information_t *OpenAPI_tsc_assistance_information_parseFr
 {
     OpenAPI_tsc_assistance_information_t *tsc_assistance_information_local_var = NULL;
     OpenAPI_lnode_t *node = NULL;
+    cJSON *flow_direction = NULL;
+    OpenAPI_tsc_flow_direction_e flow_directionVariable = 0;
     cJSON *periodicity = NULL;
-    cJSON *n6_jitter_information = NULL;
-    OpenAPI_n6_jitter_information_t *n6_jitter_information_local_nonprim = NULL;
+    flow_direction = cJSON_GetObjectItemCaseSensitive(tsc_assistance_informationJSON, "flowDirection");
+    if (flow_direction) {
+    if (!cJSON_IsString(flow_direction)) {
+        ogs_error("OpenAPI_tsc_assistance_information_parseFromJSON() failed [flow_direction]");
+        goto end;
+    }
+    flow_directionVariable = OpenAPI_tsc_flow_direction_FromString(flow_direction->valuestring);
+    }
+
     periodicity = cJSON_GetObjectItemCaseSensitive(tsc_assistance_informationJSON, "periodicity");
     if (periodicity) {
     if (!cJSON_IsNumber(periodicity)) {
@@ -84,27 +83,14 @@ OpenAPI_tsc_assistance_information_t *OpenAPI_tsc_assistance_information_parseFr
     }
     }
 
-    n6_jitter_information = cJSON_GetObjectItemCaseSensitive(tsc_assistance_informationJSON, "n6JitterInformation");
-    if (n6_jitter_information) {
-    n6_jitter_information_local_nonprim = OpenAPI_n6_jitter_information_parseFromJSON(n6_jitter_information);
-    if (!n6_jitter_information_local_nonprim) {
-        ogs_error("OpenAPI_n6_jitter_information_parseFromJSON failed [n6_jitter_information]");
-        goto end;
-    }
-    }
-
     tsc_assistance_information_local_var = OpenAPI_tsc_assistance_information_create (
+        flow_direction ? flow_directionVariable : 0,
         periodicity ? true : false,
-        periodicity ? periodicity->valuedouble : 0,
-        n6_jitter_information ? n6_jitter_information_local_nonprim : NULL
+        periodicity ? periodicity->valuedouble : 0
     );
 
     return tsc_assistance_information_local_var;
 end:
-    if (n6_jitter_information_local_nonprim) {
-        OpenAPI_n6_jitter_information_free(n6_jitter_information_local_nonprim);
-        n6_jitter_information_local_nonprim = NULL;
-    }
     return NULL;
 }
 

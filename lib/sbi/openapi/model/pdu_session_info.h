@@ -1,7 +1,7 @@
 /*
  * pdu_session_info.h
  *
- * indicates the DNN and S-NSSAI combination of a PDU session.
+ * Represents combination of PDU Session parameter(s) information.
  */
 
 #ifndef _OpenAPI_pdu_session_info_H_
@@ -13,20 +13,24 @@
 #include "../include/keyValuePair.h"
 #include "../include/binary.h"
 typedef struct OpenAPI_pdu_session_info_s OpenAPI_pdu_session_info_t;
-#include "snssai.h"
+#include "access_type.h"
+#include "pdu_session_type.h"
+#include "ssc_mode.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct OpenAPI_pdu_session_info_s {
-    struct OpenAPI_snssai_s *snssai;
-    char *dnn;
+    OpenAPI_pdu_session_type_e pdu_sess_type;
+    OpenAPI_ssc_mode_e ssc_mode;
+    OpenAPI_list_t *access_types;
 };
 
 OpenAPI_pdu_session_info_t *OpenAPI_pdu_session_info_create(
-    OpenAPI_snssai_t *snssai,
-    char *dnn
+    OpenAPI_pdu_session_type_e pdu_sess_type,
+    OpenAPI_ssc_mode_e ssc_mode,
+    OpenAPI_list_t *access_types
 );
 void OpenAPI_pdu_session_info_free(OpenAPI_pdu_session_info_t *pdu_session_info);
 OpenAPI_pdu_session_info_t *OpenAPI_pdu_session_info_parseFromJSON(cJSON *pdu_session_infoJSON);

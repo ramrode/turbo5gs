@@ -14,7 +14,7 @@
 #include "../include/binary.h"
 typedef struct OpenAPI_local_origin_s OpenAPI_local_origin_t;
 #include "geographic_area.h"
-#include "geographical_coordinates.h"
+#include "geographical_coordinates_1.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,7 +22,7 @@ extern "C" {
 
 struct OpenAPI_local_origin_s {
     char *coordinate_id;
-    struct OpenAPI_geographical_coordinates_s *point;
+    struct OpenAPI_geographical_coordinates_1_s *point;
     struct OpenAPI_geographic_area_s *area;
     bool is_horiz_axes_orientation;
     int horiz_axes_orientation;
@@ -30,7 +30,7 @@ struct OpenAPI_local_origin_s {
 
 OpenAPI_local_origin_t *OpenAPI_local_origin_create(
     char *coordinate_id,
-    OpenAPI_geographical_coordinates_t *point,
+    OpenAPI_geographical_coordinates_1_t *point,
     OpenAPI_geographic_area_t *area,
     bool is_horiz_axes_orientation,
     int horiz_axes_orientation

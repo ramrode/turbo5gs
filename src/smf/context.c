@@ -65,6 +65,69 @@ int smf_use_gy_iface(void)
     }
 }
 
+/* smf_use_chf_iface() — 5GC counterpart to smf_use_gy_iface().
+ *
+ * Returns:
+ *   1  — CHF service is available (NRF subscription active for
+ *         nchf-convergedcharging).
+ *   0  — No CHF available; caller should skip online charging.
+ *  -1  — CHF explicitly enabled in config but not reachable (error).
+ *
+ * TS 29.513 §4.2.2 — SMF selects Nchf_ConvergedCharging for 5GC PDU
+ * sessions when online charging is configured.
+ * TS 23.503 §6.3   — CHF selection procedure.
+ */
+int smf_use_chf_iface(void)
+{
+    switch (smf_self()->ctf_config.enabled) {
+    case SMF_CTF_ENABLED_AUTO:
+        /* Probe the cached NF instance list: CHF is available when at least
+         * one CHF instance advertising nchf-convergedcharging has been
+         * discovered via the NRF subscription set up in smf_sbi_open(). */
+        return ogs_sbi_nf_instance_find_by_service(
+                OpenAPI_service_name_nchf_convergedcharging,
+                OpenAPI_nf_type_SMF) ? 1 : 0;
+    case SMF_CTF_ENABLED_YES:
+        return ogs_sbi_nf_instance_find_by_service(
+                OpenAPI_service_name_nchf_convergedcharging,
+                OpenAPI_nf_type_SMF) ? 1 : -1;
+    case SMF_CTF_ENABLED_NO:
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/* smf_select_online_charging() — choose the online charging interface for a
+ * PDU session (EPC or 5GC).
+ *
+ * Decision logic (TS 29.513 §4.2.2):
+ *   1. EPC sessions use the Gy/Ro interface → SMF_OC_IFACE_GY.
+ *      Gy peer availability is verified inside the SMF_OC_IFACE_GY
+ *      switch-case by smf_use_gy_iface().
+ *   2. For 5GC sessions, prefer Nchf_ConvergedCharging (CHF) when available.
+ *   3. Fall back to NONE if no online charging NF is reachable.
+ *
+ * Returns SMF_OC_IFACE_GY  for EPC sessions (Gy/Ro).
+ * Returns SMF_OC_IFACE_CHF when smf_use_chf_iface() is positive (5GC).
+ * Returns SMF_OC_IFACE_NONE when no charging interface is reachable.
+ */
+smf_online_charging_iface_e smf_select_online_charging(smf_sess_t *sess)
+{
+    ogs_assert(sess);
+
+    /* EPC sessions always route to the Gy/Ro interface.
+     * Gy peer availability is checked inside SMF_OC_IFACE_GY case. */
+    if (sess->epc)
+        return SMF_OC_IFACE_GY;
+
+    /* 5GC sessions prefer Nchf_ConvergedCharging. */
+    if (smf_use_chf_iface() > 0)
+        return SMF_OC_IFACE_CHF;
+
+    return SMF_OC_IFACE_NONE;
+}
+
 void smf_context_init(void)
 {
     ogs_assert(context_initialized == 0);
@@ -2120,6 +2183,51 @@ void smf_sess_remove(smf_sess_t *sess)
     if (sess->s6b_sid)
         ogs_free(sess->s6b_sid);
 
+    /*
+     * Cancel any Nchf transaction still outstanding on this session.
+     *
+     * The CHF Release issued at the wait_pfcp_deletion ENTRY action is
+     * deliberately fire-and-forget, so it runs alongside the teardown chain
+     * rather than inside it.  That chain is strictly sequential (PCF delete →
+     * UDM SDM delete → UDM UECM deregister → session_will_release), and the
+     * CHF answers only after writing a CDR file and two MongoDB operations,
+     * so the Release is routinely still in flight when the chain ends here.
+     *
+     * The transaction points back at sess->sbi.  Leaving it attached makes
+     * ogs_sbi_object_free() below log "SBI running [N]" and dump the request,
+     * and — once the response or the CLIENT_WAIT timeout finally arrives —
+     * ogs_sbi_xact_remove() unlinks it from an sbi_object that no longer
+     * exists.
+     *
+     * Dropping the transaction here discards only our interest in the 204:
+     * the request has already gone to the CHF, which writes the CDR and
+     * clears its own session either way.  A later response finds no
+     * transaction and is discarded by smf-sm.c.
+     *
+     * An outstanding Release is the normal case and is not worth a
+     * warning; anything else still in flight here is.
+     */
+    if (!sess->epc) {
+        ogs_sbi_xact_t *xact = NULL, *next_xact = NULL;
+
+        ogs_list_for_each_safe(&sess->sbi.xact_list, next_xact, xact) {
+            if (xact->service_name ==
+                    OpenAPI_service_name_nchf_convergedcharging) {
+                if (sess->sm_data.nchf_release_in_flight)
+                    ogs_debug("[%d] CHF Release response not awaited "
+                              "[xact:%d]", sess->psi, xact->id);
+                else
+                    ogs_warn("[%d] Cancelling in-flight CHF transaction at "
+                             "session removal", sess->psi);
+                ogs_sbi_xact_remove(xact);
+            }
+        }
+    }
+
+    CHF_CLEAR(sess);
+    if (sess->chf_association.client)
+        ogs_sbi_client_remove(sess->chf_association.client);
+
     if (sess->session.name)
         ogs_free(sess->session.name);
     if (sess->full_dnn)
@@ -2440,6 +2548,7 @@ smf_bearer_t *smf_qos_flow_add(smf_sess_t *sess)
     urr->vol_threshold.total_volume = 1024*1024*100;
 
     ogs_pfcp_pdr_associate_urr(dl_pdr, urr);
+    ogs_pfcp_pdr_associate_urr(ul_pdr, urr);   /* GAP 4: count UL traffic too */
 
     /* QER */
     qer = ogs_pfcp_qer_add(&sess->pfcp);

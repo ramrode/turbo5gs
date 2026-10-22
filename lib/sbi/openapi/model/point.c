@@ -6,7 +6,7 @@
 
 OpenAPI_point_t *OpenAPI_point_create(
     OpenAPI_supported_gad_shapes_e shape,
-    OpenAPI_geographical_coordinates_t *point
+    OpenAPI_geographical_coordinates_1_t *point
 )
 {
     OpenAPI_point_t *point_local_var = ogs_malloc(sizeof(OpenAPI_point_t));
@@ -26,7 +26,7 @@ void OpenAPI_point_free(OpenAPI_point_t *point)
         return;
     }
     if (point->point) {
-        OpenAPI_geographical_coordinates_free(point->point);
+        OpenAPI_geographical_coordinates_1_free(point->point);
         point->point = NULL;
     }
     ogs_free(point);
@@ -56,7 +56,7 @@ cJSON *OpenAPI_point_convertToJSON(OpenAPI_point_t *point)
         ogs_error("OpenAPI_point_convertToJSON() failed [point]");
         return NULL;
     }
-    cJSON *point_local_JSON = OpenAPI_geographical_coordinates_convertToJSON(point->point);
+    cJSON *point_local_JSON = OpenAPI_geographical_coordinates_1_convertToJSON(point->point);
     if (point_local_JSON == NULL) {
         ogs_error("OpenAPI_point_convertToJSON() failed [point]");
         goto end;
@@ -78,7 +78,7 @@ OpenAPI_point_t *OpenAPI_point_parseFromJSON(cJSON *pointJSON)
     cJSON *shape = NULL;
     OpenAPI_supported_gad_shapes_e shapeVariable = 0;
     cJSON *point = NULL;
-    OpenAPI_geographical_coordinates_t *point_local_nonprim = NULL;
+    OpenAPI_geographical_coordinates_1_t *point_local_nonprim = NULL;
     shape = cJSON_GetObjectItemCaseSensitive(pointJSON, "shape");
     if (!shape) {
         ogs_error("OpenAPI_point_parseFromJSON() failed [shape]");
@@ -95,9 +95,9 @@ OpenAPI_point_t *OpenAPI_point_parseFromJSON(cJSON *pointJSON)
         ogs_error("OpenAPI_point_parseFromJSON() failed [point]");
         goto end;
     }
-    point_local_nonprim = OpenAPI_geographical_coordinates_parseFromJSON(point);
+    point_local_nonprim = OpenAPI_geographical_coordinates_1_parseFromJSON(point);
     if (!point_local_nonprim) {
-        ogs_error("OpenAPI_geographical_coordinates_parseFromJSON failed [point]");
+        ogs_error("OpenAPI_geographical_coordinates_1_parseFromJSON failed [point]");
         goto end;
     }
 
@@ -109,7 +109,7 @@ OpenAPI_point_t *OpenAPI_point_parseFromJSON(cJSON *pointJSON)
     return point_local_var;
 end:
     if (point_local_nonprim) {
-        OpenAPI_geographical_coordinates_free(point_local_nonprim);
+        OpenAPI_geographical_coordinates_1_free(point_local_nonprim);
         point_local_nonprim = NULL;
     }
     return NULL;

@@ -14,7 +14,7 @@
 #include "../include/binary.h"
 typedef struct OpenAPI_polygon_s OpenAPI_polygon_t;
 #include "gad_shape.h"
-#include "geographical_coordinates.h"
+#include "geographical_coordinates_1.h"
 #include "supported_gad_shapes.h"
 
 #ifdef __cplusplus
